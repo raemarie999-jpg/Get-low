@@ -32,10 +32,11 @@ def save_json_file(path, data):
         add_log(f"Save error {path}: {e}", "err")
         return False
 
-STATIONS = ["KPHL", "KATL"]
+STATIONS = ["KPHL", "KATL", "KOKC"]
 STATION_NAMES = {
     "KPHL": "Philadelphia International Airport",
     "KATL": "Atlanta Hartsfield-Jackson Airport",
+    "KOKC": "Oklahoma City Will Rogers World Airport",
 }
 
 ALL_KNOWN_MODELS = [
@@ -602,6 +603,7 @@ input[type=number]:focus{border-color:var(--ice)}
     <div style="display:flex;gap:6px;align-items:center">
       <button id="btn-KPHL" onclick="switchStation('KPHL')" style="background:#1e40af;border:1px solid #3b82f6;color:#93c5fd;border-radius:4px;padding:5px 12px;font-size:11px;cursor:pointer;font-family:inherit;letter-spacing:1px">KPHL</button>
       <button id="btn-KATL" onclick="switchStation('KATL')" style="background:none;border:1px solid #334155;color:#64748b;border-radius:4px;padding:5px 12px;font-size:11px;cursor:pointer;font-family:inherit;letter-spacing:1px">KATL</button>
+      <button id="btn-KOKC" onclick="switchStation('KOKC')" style="background:none;border:1px solid #334155;color:#64748b;border-radius:4px;padding:5px 12px;font-size:11px;cursor:pointer;font-family:inherit;letter-spacing:1px">KOKC</button>
     </div>
     <div class="sp"></div>
     <div style="text-align:right">
@@ -810,7 +812,7 @@ function switchStation(s){
   clearDisplay();
   try { accData = JSON.parse(localStorage.getItem("acc_lows_"+s) || "{}"); } catch(e){ accData = {}; }
   MODELS = Object.keys(accData).filter(function(m){ return m !== "NWS"; });
-  ["KPHL","KATL"].forEach(function(st){
+  ["KPHL","KATL","KOKC"].forEach(function(st){
     var btn = document.getElementById("btn-"+st);
     if(st === s){
       btn.style.background="#1e40af"; btn.style.borderColor="#3b82f6"; btn.style.color="#93c5fd";
@@ -818,7 +820,7 @@ function switchStation(s){
       btn.style.background="none"; btn.style.borderColor="#334155"; btn.style.color="#64748b";
     }
   });
-  var names = {"KPHL":"Philadelphia International Airport","KATL":"Atlanta Hartsfield-Jackson Airport"};
+  var names = {"KPHL":"Philadelphia International Airport","KATL":"Atlanta Hartsfield-Jackson Airport","KOKC":"Oklahoma City Will Rogers World Airport"};
   document.getElementById("h-sub").textContent = names[s] || s;
   buildForms(); renderPreview(); poll();
 }
@@ -1235,4 +1237,5 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
