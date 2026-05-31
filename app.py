@@ -426,19 +426,29 @@ def api_state():
             "mae": a.get("mae"), "rmse": a.get("rmse"),
             "runs": a.get("runs", {}),
         })
+    def get_mae(r):
+        if r.get("mae") not in (None, ""):
+            try: return float(r["mae"])
+            except: pass
+        run_key = r.get("run", "")
+        rd = (r.get("runs") or {}).get(run_key, {})
+        if rd.get("mae") not in (None, ""):
+            try: return float(rd["mae"])
+            except: pass
+        return None
     w_sum, w_total = 0, 0
     for r in rows:
         try:
-            mae = float(r["mae"]); adj = r["adj_low"] if r["adj_low"] is not None else r["raw_low"]
-            if mae > 0 and adj is not None:
+            mae = get_mae(r); adj = r["adj_low"] if r["adj_low"] is not None else r["raw_low"]
+            if mae and mae > 0 and adj is not None:
                 w = 1/mae; w_sum += adj*w; w_total += w
         except: pass
     consensus = round(w_sum/w_total, 1) if w_total > 0 else None
     pw_sum, pw_total = 0, 0
     for r in rows:
         try:
-            mae = float(r["mae"]); pace = r["pace"]
-            if mae > 0 and pace is not None:
+            mae = get_mae(r); pace = r["pace"]
+            if mae and mae > 0 and pace is not None:
                 w = 1/mae; pw_sum += float(pace)*w; pw_total += w
         except: pass
     consensus_pace = round(pw_sum/pw_total, 2) if pw_total > 0 else None
@@ -1225,3 +1235,4 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
