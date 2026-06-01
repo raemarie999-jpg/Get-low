@@ -117,7 +117,7 @@ def get_low_window():
         # Before 9:30AM: target CURRENT 1AM-1AM window (today 1AM -> tomorrow 1AM)
         today_1am = now_local.replace(hour=1, minute=0, second=0, microsecond=0)
         window_start_utc = today_1am + timedelta(hours=5)
-        window_end_utc = window_start_utc + timedelta(hours=24)'''
+        window_end_utc = window_start_utc + timedelta(hours=24)
     return window_start_utc, window_end_utc
 
 def low_window_entries(temps):
