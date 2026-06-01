@@ -501,6 +501,57 @@ def manual_refresh():
     threading.Thread(target=fetch_all, args=(station,), daemon=True).start()
     return jsonify({"ok": True})
 
+
+@app.route("/api/verify", methods=["POST"])
+def save_verification():
+    station = request.args.get("station", "KPHL").upper()
+    if station not in STATIONS:
+        station = "KPHL"
+    data = request.json or {}
+    actual = data.get("actual")
+    date = data.get("date")
+    if actual is None or not date:
+        return jsonify({"ok": False, "error": "Missing actual or date"}), 400
+    ensure_data_dir()
+    path = f"{DATA_DIR}/verification_{station}.json"
+    verif = load_json_file(path, {})
+    cons_path = f"{DATA_DIR}/consensus_{station}.json"
+    cons_disk = load_json_file(cons_path, {})
+    day_snaps = cons_disk.get(date, [])
+    calibration = []
+    for s in day_snaps:
+        consensus = s.get("consensus")
+        if consensus is not None:
+            error = round(float(actual) - float(consensus), 2)
+            calibration.append({
+                "time": s.get("time"),
+                "consensus": consensus,
+                "implied": s.get("implied"),
+                "pace": s.get("pace"),
+                "actual": float(actual),
+                "error": error,
+                "abs_error": abs(error),
+            })
+    verif[date] = {
+        "date": date,
+        "actual": float(actual),
+        "metric": "low",
+        "snapshot_count": len(day_snaps),
+        "calibration": calibration,
+        "entered_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    save_json_file(path, verif)
+    add_log(f"Verification saved: {date} actual={actual} ({len(calibration)} snapshots calibrated)", "ok", station)
+    return jsonify({"ok": True, "calibration_points": len(calibration)})
+
+@app.route("/api/verification")
+def get_verification():
+    station = request.args.get("station", "KPHL").upper()
+    if station not in STATIONS:
+        station = "KPHL"
+    verif = load_json_file(f"{DATA_DIR}/verification_{station}.json", {})
+    return jsonify(verif)
+
 @app.route("/")
 def index():
     return render_template_string(HTML)
@@ -623,6 +674,7 @@ input[type=number]:focus{border-color:var(--ice)}
   <button onclick="showTab('log',this)">&#128319; Log</button>
   <button onclick="showTab('history',this)">&#128196; History</button>
   <button onclick="showTab('snapshots',this);loadSnapshots();">&#128248; Snapshots</button>
+  <button onclick="showTab('verification',this);loadVerification();">&#9989; Verification</button>
 </nav>
 
 <main>
@@ -782,6 +834,44 @@ input[type=number]:focus{border-color:var(--ice)}
   </div>
 </div>
 
+
+<!-- VERIFICATION TAB -->
+<div class="tab" id="tab-verification">
+  <div class="card" style="border-color:#1e3a5f">
+    <div class="ctitle">Enter Previous Day Actual Low</div>
+    <p style="color:var(--dim);font-size:12px;line-height:1.7;margin-bottom:12px">Enter after the CLI report (~10-11AM). This calibrates your consensus snapshots against reality.</p>
+    <div style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
+      <div>
+        <div style="font-size:10px;color:var(--dim);letter-spacing:1px;margin-bottom:4px">DATE</div>
+        <input type="date" id="verif-date" style="background:var(--bg);border:1px solid #1e2e42;border-radius:4px;color:var(--text);padding:6px 10px;font-family:inherit;font-size:12px;outline:none">
+      </div>
+      <div>
+        <div style="font-size:10px;color:var(--dim);letter-spacing:1px;margin-bottom:4px">ACTUAL LOW (°F)</div>
+        <input type="number" step="0.1" id="verif-actual" placeholder="e.g. 58.2" style="width:120px;background:var(--bg);border:1px solid #1e2e42;border-radius:4px;color:var(--text);padding:6px 10px;font-family:inherit;font-size:12px;outline:none">
+      </div>
+      <button class="btn btn-green" onclick="submitVerification()">Save</button>
+      <span style="font-size:10px;color:var(--dim)" id="verif-status"></span>
+    </div>
+  </div>
+  <div class="card" id="verif-results" style="display:none">
+    <div class="ctitle">Calibration Results</div>
+    <div style="overflow-x:auto">
+      <table>
+        <thead><tr><th>Time</th><th>Consensus</th><th>Implied Adj</th><th>Actual</th><th>Error</th><th>Abs Error</th></tr></thead>
+        <tbody id="verif-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+  <div class="card">
+    <div class="ctitle">Calibration History</div>
+    <div style="overflow-x:auto">
+      <table>
+        <thead><tr><th>Date</th><th>Actual</th><th>Snapshots</th><th>Avg Error</th><th>Avg Abs Error</th><th>Best Snap</th></tr></thead>
+        <tbody id="verif-hist-tbody"><tr><td colspan="6" style="color:var(--dim)">No verification data yet.</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</div>
 </main>
 
 <script>
@@ -1214,6 +1304,86 @@ document.querySelectorAll("nav button").forEach(function(btn){
     if(btn.textContent.includes("History")) loadHistory();
   });
 });
+
+function loadVerification(){
+  var d = new Date(); d.setDate(d.getDate()-1);
+  var ds = d.toISOString().slice(0,10);
+  document.getElementById("verif-date").value = ds;
+  fetch("/api/verification?station="+STATION)
+    .then(function(r){ return r.json(); })
+    .then(function(data){
+      var dates = Object.keys(data).sort().reverse();
+      var tbody = document.getElementById("verif-hist-tbody");
+      if(!dates.length){
+        tbody.innerHTML = '<tr><td colspan="6" style="color:var(--dim)">No verification data yet.</td></tr>';
+        return;
+      }
+      tbody.innerHTML = dates.map(function(d,i){
+        var v = data[d];
+        var cal = v.calibration || [];
+        var avgErr = cal.length ? round1(cal.reduce(function(a,b){ return a+b.error; },0)/cal.length) : "--";
+        var avgAbs = cal.length ? round1(cal.reduce(function(a,b){ return a+b.abs_error; },0)/cal.length) : "--";
+        var best = cal.length ? cal.reduce(function(a,b){ return a.abs_error < b.abs_error ? a : b; }) : null;
+        var bestStr = best ? best.time+" ("+fmtC(best.error)+")" : "--";
+        var bg = i%2?"background:#0a1018":"";
+        var ec = typeof avgErr === "number" ? corrColor(avgErr) : "var(--dim)";
+        return '<tr style="'+bg+'">'
+          +'<td style="color:#e8f0f8">'+d+'</td>'
+          +'<td style="color:var(--ice)">'+v.actual+'F</td>'
+          +'<td style="color:var(--dim)">'+v.snapshot_count+'</td>'
+          +'<td style="color:'+ec+'">'+(typeof avgErr==="number"?(avgErr>=0?"+":"")+avgErr+"F":"--")+'</td>'
+          +'<td style="color:'+maeColor(avgAbs)+'">'+(typeof avgAbs==="number"?avgAbs+"F":"--")+'</td>'
+          +'<td style="color:var(--dim);font-size:11px">'+bestStr+'</td>'
+          +'</tr>';
+      }).join("");
+    }).catch(function(e){ console.error("Verification load error",e); });
+}
+function round1(v){ return Math.round(v*10)/10; }
+function submitVerification(){
+  var date = document.getElementById("verif-date").value;
+  var actual = document.getElementById("verif-actual").value;
+  var status = document.getElementById("verif-status");
+  if(!date || !actual){ status.style.color="var(--red)"; status.textContent="Date and actual required."; return; }
+  fetch("/api/verify?station="+STATION,{
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({date:date, actual:parseFloat(actual), metric:"low"})
+  }).then(function(r){ return r.json(); })
+  .then(function(data){
+    if(data.ok){
+      status.style.color="var(--green)";
+      status.textContent = "Saved. "+data.calibration_points+" snapshots calibrated.";
+      fetch("/api/verification?station="+STATION)
+        .then(function(r){ return r.json(); })
+        .then(function(verif){
+          var v = verif[date];
+          if(v && v.calibration && v.calibration.length){
+            document.getElementById("verif-results").style.display="block";
+            document.getElementById("verif-tbody").innerHTML = v.calibration.map(function(c,i){
+              var bg = i%2?"background:#0a1018":"";
+              var ec = corrColor(c.error);
+              return '<tr style="'+bg+'">'
+                +'<td style="color:var(--dim)">'+c.time+'</td>'
+                +'<td style="color:var(--blue)">'+c.consensus+'F</td>'
+                +'<td style="color:var(--ice)">'+(c.implied!=null?c.implied+"F":"--")+'</td>'
+                +'<td style="color:var(--yellow)">'+c.actual+'F</td>'
+                +'<td style="color:'+ec+'">'+(c.error>=0?"+":"")+c.error+'F</td>'
+                +'<td style="color:'+maeColor(c.abs_error)+'">'+c.abs_error+'F</td>'
+                +'</tr>';
+            }).join("");
+          }
+          loadVerification();
+        });
+    } else {
+      status.style.color="var(--red)"; status.textContent="Error: "+(data.error||"unknown");
+    }
+  }).catch(function(e){ status.style.color="var(--red)"; status.textContent="Error: "+e.message; });
+}
+document.querySelectorAll("nav button").forEach(function(btn){
+  btn.addEventListener("click", function(){
+    if(btn.textContent.includes("Verification")) loadVerification();
+  });
+});
 </script>
 </body>
 </html>
@@ -1237,5 +1407,6 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
