@@ -4,11 +4,12 @@ from flask import Flask, jsonify, request, render_template_string
 import requests
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024
+app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024  # 2MB limit
 
 API_KEY = os.environ.get("WETHR_API_KEY", "")
 DATA_DIR = "/data"
-REFRESH_SEC = 1200  # 20 minutes
+PACING_FILE = f"{DATA_DIR}/pacing_snapshots.json"
+HISTORY_FILE = f"{DATA_DIR}/daily_history.json"
 
 def ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -32,24 +33,23 @@ def save_json_file(path, data):
         add_log(f"Save error {path}: {e}", "err")
         return False
 
-STATIONS = ["KPHL", "KATL", "KOKC"]
-STATION_NAMES = {
-    "KPHL": "Philadelphia International Airport",
-    "KATL": "Atlanta Hartsfield-Jackson Airport",
-    "KOKC": "Oklahoma City Will Rogers World Airport",
-}
+STATIONS = ["KOKC", "KPHL"]
+STATION_NAMES = {"KOKC": "Oklahoma City", "KPHL": "Philadelphia"}
 
 ALL_KNOWN_MODELS = [
     "ARPEGE","HRRR","UKMO","LAV-MOS","NAM","RAP","GEM-GDPS","NAM-MOS","NBM",
     "NAM4KM","GFS","ICON","GFS-MOS","ECMWF-HRES","GEFS","JMA","RDPS","SREF"
 ]
-REFRESH_SEC = 1200
+RUN_CYCLES = ["00Z","01Z","02Z","03Z","04Z","05Z","06Z","07Z","08Z","09Z","10Z","11Z",
+              "12Z","13Z","14Z","15Z","16Z","17Z","18Z","19Z","20Z","21Z","22Z","23Z"]
+REFRESH_SEC = 600
 
 def make_state():
     return {
         "obs": None,
-        "wethr_low": None,
+        "wethr_high": None,
         "forecasts": {},
+        "nws_versions": {},
         "accuracy": {},
         "last_updated": None,
         "errors": [],
@@ -61,13 +61,14 @@ def make_state():
 states = {s: make_state() for s in STATIONS}
 
 def get_state(station=None):
-    return states.get(station or "KPHL", states["KPHL"])
+    return states.get(station or "KOKC", states["KOKC"])
 
-def active_models(station="KPHL"):
+def active_models(station="KOKC"):
     acc = get_state(station).get("accuracy", {})
-    return [m for m in acc.keys() if m != "NWS"] if acc else ALL_KNOWN_MODELS
+    models = [m for m in acc.keys() if m != "NWS"] if acc else ALL_KNOWN_MODELS
+    return models
 
-def add_log(msg, level="info", station="KPHL"):
+def add_log(msg, level="info", station="KOKC"):
     entry = {"t": datetime.now().strftime("%H:%M:%S"), "msg": msg, "level": level}
     st = get_state(station)
     st["log"].insert(0, entry)
@@ -84,7 +85,7 @@ def wethr_get(path):
     return r.json()
 
 def get_temp(x):
-    for k in ["temperature_f","temperature_display","temperature","temp","value","low"]:
+    for k in ["temperature_f","temperature_display","temperature","temp","value","high"]:
         v = x.get(k)
         if v is not None:
             try: return round(float(v), 1)
@@ -96,33 +97,21 @@ def parse_vt(x):
     try: return datetime.strptime(vt[:16], "%Y-%m-%d %H:%M")
     except: return None
 
-def local_now():
-    # Use UTC-5 as base local time (same as highs app)
-    return datetime.utcnow() - timedelta(hours=5)
+def okc_day_bounds(offset=0):
+    utc_now = datetime.utcnow()
+    okc_local = utc_now - timedelta(hours=5)
+    day_start = okc_local.replace(hour=0,minute=0,second=0,microsecond=0) + timedelta(hours=5) + timedelta(days=offset)
+    day_end = day_start + timedelta(hours=24)
+    return day_start, day_end
 
-def get_low_window():
-    """
-    Returns (window_start, window_end) for the current target low period.
-    From noon onward: target is NEXT 1AM-1AM window.
-    Before noon: target is CURRENT 1AM-1AM window (1AM today -> 1AM tomorrow).
-    Window is in UTC.
-    """
-    now_local = local_now()
-    if now_local.hour > 9 or (now_local.hour == 9 and now_local.minute >= 30):
-        # 9:30AM or later: target NEXT 1AM-1AM window (tomorrow 1AM -> day after 1AM)
-        tomorrow = now_local.replace(hour=1, minute=0, second=0, microsecond=0) + timedelta(days=1)
-        window_start_utc = tomorrow + timedelta(hours=5)
-        window_end_utc = window_start_utc + timedelta(hours=24)
-    else:
-        # Before 9:30AM: target CURRENT 1AM-1AM window (today 1AM -> tomorrow 1AM)
-        today_1am = now_local.replace(hour=1, minute=0, second=0, microsecond=0)
-        window_start_utc = today_1am + timedelta(hours=5)
-        window_end_utc = window_start_utc + timedelta(hours=24)
-    return window_start_utc, window_end_utc
+def today_entries(temps):
+    day_start, day_end = okc_day_bounds(0)
+    filtered = [x for x in temps if parse_vt(x) is not None and day_start <= parse_vt(x) < day_end]
+    return filtered if filtered else temps
 
-def low_window_entries(temps):
-    window_start, window_end = get_low_window()
-    filtered = [x for x in temps if parse_vt(x) is not None and window_start <= parse_vt(x) < window_end]
+def tomorrow_entries(temps):
+    day_start, day_end = okc_day_bounds(1)
+    filtered = [x for x in temps if parse_vt(x) is not None and day_start <= parse_vt(x) < day_end]
     return filtered
 
 def fmt_run(run_raw):
@@ -133,7 +122,7 @@ def fmt_run(run_raw):
     except:
         return "—"
 
-def fetch_all(station="KPHL"):
+def fetch_all(station="KOKC"):
     st = get_state(station)
     if not API_KEY:
         add_log("No API key set", "err", station)
@@ -150,96 +139,102 @@ def fetch_all(station="KPHL"):
         errors.append(f"Obs: {e}")
         add_log(f"Obs error: {e}", "err", station)
 
-    # Wethr low
+    # Wethr high
     try:
-        wl = wethr_get(f"observations.php?station_code={station}&mode=wethr_high&logic=nws")
-        st["wethr_low"] = wl
-        add_log(f"Wethr Low: {wl.get('wethr_low')}F", "ok", station)
+        wh = wethr_get(f"observations.php?station_code={station}&mode=wethr_high&logic=nws")
+        st["wethr_high"] = wh
+        add_log(f"Wethr High: {wh.get('wethr_high')}F", "ok", station)
     except Exception as e:
-        errors.append(f"WethrLow: {e}")
-        add_log(f"Wethr Low error: {e}", "err", station)
+        errors.append(f"WethrHigh: {e}")
+        add_log(f"Wethr High error: {e}", "err", station)
 
+    # Forecasts per model — only fetch models in accuracy data, skip if none loaded
     fetch_targets = active_models(station)
     if not fetch_targets:
         add_log("No accuracy data yet — skipping model fetch", "warn", station)
         return
-
     utc_now = datetime.utcnow()
-    window_start, window_end = get_low_window()
-
     for model in fetch_targets:
         try:
             data = wethr_get(f"forecasts.php?location_name={station}&model={requests.utils.quote(model)}&run=latest")
             temps = data if isinstance(data, list) else data.get("forecasts", [])
             meta = {} if isinstance(data, list) else data
             if temps:
-                window = low_window_entries(temps)
-                if not window:
-                    add_log(f"{model}: no entries in low window", "warn", station)
-                    continue
-                # Forecast low = min temp in window
-                min_entry = min(window, key=lambda x: get_temp(x) or 999)
-                raw_temp = get_temp(min_entry)
-                # Current forecast = model's forecast for closest hour to now within window
-                # If we're before the window, use the first entry
-                in_window = [x for x in window if parse_vt(x) is not None and parse_vt(x) <= datetime.utcnow()]
-                if in_window:
-                    closest = min(in_window, key=lambda x: abs((parse_vt(x) - utc_now).total_seconds()) if parse_vt(x) else 99999)
-                else:
-                    closest = min(window, key=lambda x: abs((parse_vt(x) - utc_now).total_seconds()) if parse_vt(x) else 99999)
+                todays = today_entries(temps)
+                max_entry = max(todays, key=lambda x: get_temp(x) or 0)
+                raw_temp = get_temp(max_entry)
+                closest = min(todays, key=lambda x: abs((parse_vt(x) - utc_now).total_seconds()) if parse_vt(x) else 99999)
                 current_temp = get_temp(closest)
-                run_raw = meta.get("run_time") or min_entry.get("run_time") or min_entry.get("run") or ""
+                run_raw = meta.get("run_time") or max_entry.get("run_time") or max_entry.get("run") or ""
                 run_fmt = fmt_run(run_raw)
-                # Local time of forecast low
-                vt = parse_vt(min_entry)
-                low_time = None
-                if vt:
-                    local_vt = vt - timedelta(hours=5)
-                    low_time = local_vt.strftime("%-I:%M%p").lower()
+                # Tomorrow's high and low
+                tomorrows = tomorrow_entries(temps)
+                tmr_max = max(tomorrows, key=lambda x: get_temp(x) or 0) if tomorrows else None
+                tmr_temp = get_temp(tmr_max) if tmr_max else None
+                tmr_min = min(tomorrows, key=lambda x: get_temp(x) or 999) if tomorrows else None
+                tmr_low = get_temp(tmr_min) if tmr_min else None
+                tmr_low_time = None
+                if tmr_min:
+                    vt = parse_vt(tmr_min)
+                    if vt:
+                        local_vt = vt - timedelta(hours=5)
+                        tmr_low_time = local_vt.strftime("%-I:%M%p").lower()
 
                 st["forecasts"][model] = {
-                    "low": raw_temp,
+                    "high": raw_temp,
                     "current_fcst": current_temp,
                     "run": run_fmt,
-                    "low_time": low_time,
-                    "window_entries": len(window),
+                    "tmr_high": tmr_temp,
+                    "tmr_low": tmr_low,
+                    "tmr_low_time": tmr_low_time,
                 }
-                add_log(f"{model}: low={raw_temp} now={current_temp} run={run_fmt} ({len(window)} entries)", "ok", station)
+                add_log(f"{model}: high={raw_temp} now={current_temp} run={run_fmt} ({len(todays)} entries)", "ok", station)
         except Exception as e:
             errors.append(f"{model}: {e}")
             add_log(f"{model} error: {str(e)[:80]}", "warn", station)
+
+    # NWS skipped for now — endpoint TBD
+    st["nws_versions"] = {}
 
     st["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     st["errors"] = errors
     add_log(f"Done. {len(st['forecasts'])} models loaded.", "ok", station)
 
+    # Save pacing snapshot here — guaranteed to run after fetch completes
     try:
         rows = build_snapshot_rows(station)
         save_pacing_snapshot(rows, station)
     except Exception as e:
         add_log(f"Snapshot error: {e}", "warn", station)
-
+    # Save consensus snapshot every 30 min
     try:
-        now_local = local_now()
-        if now_local.minute < 20 or (now_local.minute >= 30 and now_local.minute < 50):
+        now_local = okc_local_now()
+        if now_local.minute < 10 or (now_local.minute >= 30 and now_local.minute < 40):
             save_consensus_snapshot(station)
     except Exception as e:
         add_log(f"Consensus snapshot error: {e}", "warn", station)
 
+
+def okc_local_now():
+    return datetime.utcnow() - timedelta(hours=5)
+
 _memory_snapshots = {}
 
-def save_pacing_snapshot(rows, station="KPHL"):
+def save_pacing_snapshot(rows, station="KOKC"):
     st = get_state(station)
-    now = local_now()
+    now = okc_local_now()
     date_str = now.strftime("%Y-%m-%d")
     time_str = now.strftime("%H:%M")
+
     entry = {"time": time_str}
     for r in rows:
         if r.get("pace") is not None:
             entry[r["model"]] = r["pace"]
+
     if date_str not in _memory_snapshots:
         _memory_snapshots[date_str] = []
     _memory_snapshots[date_str].append(entry)
+
     avg = {}
     for r in rows:
         m = r["model"]
@@ -247,6 +242,7 @@ def save_pacing_snapshot(rows, station="KPHL"):
         if vals:
             avg[m] = round(sum(vals)/len(vals), 2)
     st["today_avg_pace"] = avg
+
     try:
         ensure_data_dir()
         disk = load_json_file(f"{DATA_DIR}/pacing_{station}.json", {})
@@ -260,15 +256,18 @@ def save_pacing_snapshot(rows, station="KPHL"):
         save_json_file(f"{DATA_DIR}/pacing_{station}.json", disk)
     except Exception as e:
         add_log(f"Disk snapshot error (non-fatal): {e}", "warn", station)
-    add_log(f"Snapshot: {len([r for r in rows if r.get('pace') is not None])} models saved", "info", station)
 
-def rollup_daily_history(station="KPHL"):
-    now = local_now()
+    add_log(f"Snapshot: {len([r for r in rows if r.get('pace') is not None])} models | avg pace sample: {list(avg.items())[:3]}", "info", station)
+
+def rollup_daily_history(station="KOKC"):
+    now = okc_local_now()
     yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
-    snapshots = load_json_file(f"{DATA_DIR}/pacing_{station}.json", {})
+    pacing_file = f"{DATA_DIR}/pacing_{station}.json"
+    history_file = f"{DATA_DIR}/history_{station}.json"
+    snapshots = load_json_file(pacing_file, {})
     if yesterday not in snapshots or not snapshots[yesterday]:
         return
-    history = load_json_file(f"{DATA_DIR}/history_{station}.json", {})
+    history = load_json_file(history_file, {})
     if yesterday in history:
         return
     day_snaps = snapshots[yesterday]
@@ -281,10 +280,10 @@ def rollup_daily_history(station="KPHL"):
         if vals:
             daily_avg[m] = round(sum(vals)/len(vals), 2)
     history[yesterday] = {"avg_pace": daily_avg, "snapshot_count": len(day_snaps), "date": yesterday}
-    save_json_file(f"{DATA_DIR}/history_{station}.json", history)
+    save_json_file(history_file, history)
     add_log(f"Rolled up history for {yesterday} ({len(day_snaps)} snapshots)", "ok", station)
 
-def build_snapshot_rows(station="KPHL"):
+def build_snapshot_rows(station="KOKC"):
     st = get_state(station)
     acc = st["accuracy"]
     models = [m for m in acc.keys() if m != "NWS"] if acc else ALL_KNOWN_MODELS
@@ -300,10 +299,20 @@ def build_snapshot_rows(station="KPHL"):
         rows.append({"model": model, "pace": pace})
     return rows
 
-def save_consensus_snapshot(station="KPHL"):
+def scheduled_fetch():
+    for i, station in enumerate(STATIONS):
+        if i > 0:
+            time.sleep(30)
+        t = threading.Thread(target=fetch_all, args=(station,), daemon=True)
+        t.start()
+        t.join(timeout=120)
+        if t.is_alive():
+            add_log("Fetch timed out", "err", station)
+
+def save_consensus_snapshot(station="KOKC"):
     st = get_state(station)
-    now = local_now()
-    if now.hour < 12 or now.hour >= 23:
+    now = okc_local_now()
+    if now.hour < 6 or now.hour >= 22:
         return
     date_str = now.strftime("%Y-%m-%d")
     time_str = now.strftime("%H:%M")
@@ -316,7 +325,7 @@ def save_consensus_snapshot(station="KPHL"):
     for model in models:
         a = acc.get(model, {})
         fcst = forecasts.get(model, {})
-        raw = fcst.get("low")
+        raw = fcst.get("high")
         current_run = fcst.get("run", "")
         run_corr = (a.get("runs") or {}).get(current_run, {}).get("correction")
         overall_corr = a.get("correction")
@@ -340,13 +349,15 @@ def save_consensus_snapshot(station="KPHL"):
     if consensus is None:
         return
     entry = {
-        "time": time_str, "date": date_str,
-        "consensus": consensus, "implied": implied,
+        "time": time_str,
+        "consensus": consensus,
+        "implied": implied,
         "pace": cons_pace,
         "obs": float(obs_temp) if obs_temp else None,
     }
     snaps = st["consensus_snapshots"]
     snaps = [s for s in snaps if s.get("date") == date_str]
+    entry["date"] = date_str
     snaps.append(entry)
     st["consensus_snapshots"] = snaps[-48:]
     try:
@@ -363,16 +374,6 @@ def save_consensus_snapshot(station="KPHL"):
     except Exception as e:
         add_log(f"Consensus snapshot error: {e}", "warn", station)
 
-def scheduled_fetch():
-    for i, station in enumerate(STATIONS):
-        if i > 0:
-            time.sleep(30)
-        t = threading.Thread(target=fetch_all, args=(station,), daemon=True)
-        t.start()
-        t.join(timeout=120)
-        if t.is_alive():
-            add_log("Fetch timed out", "err", station)
-
 def background_loop():
     while True:
         try:
@@ -380,7 +381,7 @@ def background_loop():
         except Exception as e:
             print(f"Loop error: {e}")
         try:
-            now = local_now()
+            now = okc_local_now()
             if now.hour == 1:
                 for station in STATIONS:
                     rollup_daily_history(station)
@@ -388,43 +389,57 @@ def background_loop():
             print(f"Rollup error: {e}")
         time.sleep(REFRESH_SEC)
 
-def _get_prev_days(n, station="KPHL"):
+def _get_prev_days(n, station="KOKC"):
     history = load_json_file(f"{DATA_DIR}/history_{station}.json", {})
     keys = sorted(history.keys(), reverse=True)[:n]
-    return [{"date": k, "avg_pace": history[k]["avg_pace"], "snapshot_count": history[k].get("snapshot_count", 0)} for k in keys]
+    return [{"date": k, "avg_pace": history[k]["avg_pace"], "snapshot_count": history[k].get("snapshot_count",0)} for k in keys]
 
 @app.route("/api/state")
 def api_state():
-    station = request.args.get("station", "KPHL").upper()
+    station = request.args.get("station", "KOKC").upper()
     if station not in STATIONS:
-        station = "KPHL"
+        station = "KOKC"
     st = get_state(station)
     acc = st["accuracy"]
     models = active_models(station)
     rows = []
-    window_start, window_end = get_low_window()
     for i, model in enumerate(models):
         a = acc.get(model, {})
         fcst = st["forecasts"].get(model, {})
-        raw = fcst.get("low")
-        current_run = fcst.get("run", "")
+        raw = fcst.get("high")
+        current_run = fcst.get("run","")
         run_corr = (a.get("runs") or {}).get(current_run, {}).get("correction")
         overall_corr = a.get("correction")
-        corr = run_corr if (run_corr not in (None, "")) else overall_corr
-        try: adj = round(float(raw) + float(corr), 1) if raw is not None and corr not in (None, "") else None
+        corr = run_corr if (run_corr not in (None,"")) else overall_corr
+        try: adj = round(float(raw) + float(corr), 1) if raw is not None and corr not in (None,"") else None
         except: adj = None
         obs_temp = (st["obs"] or {}).get("temperature_display")
         current_fcst = fcst.get("current_fcst")
         try: pace = round(float(obs_temp) - float(current_fcst), 1) if obs_temp and current_fcst else None
         except: pace = None
+        tmr_raw = fcst.get("tmr_high")
+        tmr_low = fcst.get("tmr_low")
+        tmr_low_time = fcst.get("tmr_low_time")
+        try: tmr_adj = round(float(tmr_raw) + float(corr), 1) if tmr_raw is not None and corr not in (None,"") else tmr_raw
+        except: tmr_adj = tmr_raw
+        try: tmr_low_adj = round(float(tmr_low) + float(corr), 1) if tmr_low is not None and corr not in (None,"") else tmr_low
+        except: tmr_low_adj = tmr_low
+
+        display_mae = a.get("mae")
+        if display_mae is None:
+            run_mae = (a.get("runs") or {}).get(current_run, {}).get("mae")
+            if run_mae not in (None, ""):
+                try: display_mae = float(run_mae)
+                except: pass
         rows.append({
             "rank": i+1, "model": model,
-            "run": fcst.get("run", "—"),
-            "raw_low": raw, "correction": corr,
-            "corr_source": "run" if (run_corr not in (None, "")) else "overall",
-            "adj_low": adj, "pace": pace,
-            "low_time": fcst.get("low_time"),
-            "mae": a.get("mae"), "rmse": a.get("rmse"),
+            "run": fcst.get("run","—"),
+            "raw_high": raw, "correction": corr,
+            "corr_source": "run" if (run_corr not in (None,"")) else "overall",
+            "adj_high": adj, "pace": pace,
+            "tmr_high": tmr_raw, "tmr_adj": tmr_adj,
+            "tmr_low": tmr_low, "tmr_low_adj": tmr_low_adj, "tmr_low_time": tmr_low_time,
+            "mae": display_mae, "rmse": a.get("rmse"),
             "runs": a.get("runs", {}),
         })
     def get_mae(r):
@@ -440,7 +455,7 @@ def api_state():
     w_sum, w_total = 0, 0
     for r in rows:
         try:
-            mae = get_mae(r); adj = r["adj_low"] if r["adj_low"] is not None else r["raw_low"]
+            mae = get_mae(r); adj = r["adj_high"] if r["adj_high"] is not None else r["raw_high"]
             if mae and mae > 0 and adj is not None:
                 w = 1/mae; w_sum += adj*w; w_total += w
         except: pass
@@ -453,71 +468,85 @@ def api_state():
                 w = 1/mae; pw_sum += float(pace)*w; pw_total += w
         except: pass
     consensus_pace = round(pw_sum/pw_total, 2) if pw_total > 0 else None
-    # Window label for display
-    ws_local = window_start - timedelta(hours=5)
-    we_local = window_end - timedelta(hours=5)
-    window_label = f"{ws_local.strftime('%a %-I%p')} – {we_local.strftime('%a %-I%p')}"
+    tw_sum, tw_total = 0, 0
+    for r in rows:
+        try:
+            mae = get_mae(r); tadj = r["tmr_adj"] if r["tmr_adj"] is not None else r["tmr_high"]
+            if mae and mae > 0 and tadj is not None:
+                w = 1/mae; tw_sum += tadj*w; tw_total += w
+        except: pass
+    tmr_consensus = round(tw_sum/tw_total, 1) if tw_total > 0 else None
     return jsonify({
-        "station": station, "obs": st["obs"], "wethr_low": st["wethr_low"],
+        "station": station, "obs": st["obs"], "wethr_high": st["wethr_high"],
         "rows": rows, "consensus": consensus,
         "last_updated": st["last_updated"], "errors": st["errors"],
         "log": st["log"][:30], "models": active_models(station),
+        "nws_versions": st["nws_versions"],
+        "tmr_consensus": tmr_consensus,
         "consensus_pace": consensus_pace,
         "today_avg_pace": st["today_avg_pace"],
-        "today_snapshot_count": len(load_json_file(f"{DATA_DIR}/pacing_{station}.json", {}).get(local_now().strftime("%Y-%m-%d"), [])),
+        "today_snapshot_count": len(load_json_file(f"{DATA_DIR}/pacing_{station}.json", {}).get(okc_local_now().strftime("%Y-%m-%d"), [])),
         "prev_days": _get_prev_days(3, station),
-        "window_label": window_label,
     })
 
 @app.route("/api/history")
 def api_history():
-    station = request.args.get("station", "KPHL").upper()
+    station = request.args.get("station", "KOKC").upper()
     if station not in STATIONS:
-        station = "KPHL"
-    return jsonify(load_json_file(f"{DATA_DIR}/history_{station}.json", {}))
+        station = "KOKC"
+    history = load_json_file(f"{DATA_DIR}/history_{station}.json", {})
+    return jsonify(history)
 
 @app.route("/api/accuracy", methods=["POST"])
 def save_accuracy():
-    station = request.args.get("station", "KPHL").upper()
+    station = request.args.get("station", "KOKC").upper()
     if station not in STATIONS:
-        station = "KPHL"
+        station = "KOKC"
     get_state(station)["accuracy"] = request.json or {}
     add_log("Accuracy data updated", "ok", station)
     return jsonify({"ok": True})
 
 @app.route("/api/consensus_snapshots")
 def api_consensus_snapshots():
-    station = request.args.get("station", "KPHL").upper()
-    if station not in STATIONS: station = "KPHL"
+    station = request.args.get("station", "KOKC").upper()
+    if station not in STATIONS: station = "KOKC"
     st = get_state(station)
+    today = okc_local_now().strftime("%Y-%m-%d")
     disk = load_json_file(f"{DATA_DIR}/consensus_{station}.json", {})
-    return jsonify({"today": st.get("consensus_snapshots", []), "history": disk, "station": station})
+    return jsonify({
+        "today": st.get("consensus_snapshots", []),
+        "history": disk,
+        "station": station,
+    })
 
 @app.route("/api/refresh", methods=["POST"])
 def manual_refresh():
-    station = request.args.get("station", "KPHL").upper()
+    station = request.args.get("station", "KOKC").upper()
     if station not in STATIONS:
-        station = "KPHL"
+        station = "KOKC"
     threading.Thread(target=fetch_all, args=(station,), daemon=True).start()
     return jsonify({"ok": True})
 
 
 @app.route("/api/verify", methods=["POST"])
 def save_verification():
-    station = request.args.get("station", "KPHL").upper()
+    station = request.args.get("station", "KOKC").upper()
     if station not in STATIONS:
-        station = "KPHL"
+        station = "KOKC"
     data = request.json or {}
     actual = data.get("actual")
     date = data.get("date")
+    metric = data.get("metric", "high")  # "high" or "low"
     if actual is None or not date:
         return jsonify({"ok": False, "error": "Missing actual or date"}), 400
     ensure_data_dir()
     path = f"{DATA_DIR}/verification_{station}.json"
     verif = load_json_file(path, {})
+    # Load consensus snapshots for that date
     cons_path = f"{DATA_DIR}/consensus_{station}.json"
     cons_disk = load_json_file(cons_path, {})
     day_snaps = cons_disk.get(date, [])
+    # Calculate error per snapshot
     calibration = []
     for s in day_snaps:
         consensus = s.get("consensus")
@@ -535,7 +564,7 @@ def save_verification():
     verif[date] = {
         "date": date,
         "actual": float(actual),
-        "metric": "low",
+        "metric": metric,
         "snapshot_count": len(day_snaps),
         "calibration": calibration,
         "entered_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -546,9 +575,9 @@ def save_verification():
 
 @app.route("/api/verification")
 def get_verification():
-    station = request.args.get("station", "KPHL").upper()
+    station = request.args.get("station", "KOKC").upper()
     if station not in STATIONS:
-        station = "KPHL"
+        station = "KOKC"
     verif = load_json_file(f"{DATA_DIR}/verification_{station}.json", {})
     return jsonify(verif)
 
@@ -561,7 +590,7 @@ HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Low Temp Tracker</title>
+<title>KOKC Model Tracker</title>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600;700&display=swap');
 *{box-sizing:border-box;margin:0;padding:0}
@@ -569,7 +598,6 @@ HTML = """<!DOCTYPE html>
   --bg:#080c10;--bg2:#0e1520;--bg3:#0b1118;--border:#1a2535;
   --text:#c9d4e0;--dim:#4a6080;--dimmer:#2a3a50;
   --blue:#38bdf8;--green:#4ade80;--yellow:#facc15;--red:#f87171;--purple:#c084fc;
-  --ice:#a5f3fc;
 }
 body{background:var(--bg);color:var(--text);font-family:'IBM Plex Mono',monospace;font-size:13px;min-height:100vh}
 header{background:var(--bg3);border-bottom:1px solid var(--border);padding:14px 20px;
@@ -585,11 +613,11 @@ nav{display:flex;gap:2px;background:var(--bg3);border-bottom:1px solid var(--bor
 nav button{background:none;border:none;border-bottom:2px solid transparent;color:var(--dim);
   padding:10px 16px;font-size:11px;letter-spacing:1.5px;text-transform:uppercase;
   cursor:pointer;font-family:inherit;transition:color .15s}
-nav button.active{border-bottom-color:var(--ice);color:var(--ice)}
+nav button.active{border-bottom-color:var(--blue);color:var(--blue)}
 main{padding:20px;max-width:1100px;margin:0 auto}
 .tab{display:none}.tab.active{display:block}
 .card{background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:16px 18px;margin-bottom:16px}
-.ctitle{font-size:10px;letter-spacing:2.5px;color:var(--ice);text-transform:uppercase;margin-bottom:12px}
+.ctitle{font-size:10px;letter-spacing:2.5px;color:var(--blue);text-transform:uppercase;margin-bottom:12px}
 .srow{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}
 .sc{background:#0b1520;border:1px solid var(--border);border-radius:6px;padding:12px 16px;flex:1;min-width:120px}
 .sc .lbl{font-size:9px;letter-spacing:2px;color:var(--dim);text-transform:uppercase}
@@ -602,8 +630,8 @@ td{padding:8px 10px;border-bottom:1px solid #111922;white-space:nowrap}
 tr:nth-child(even) td{background:#0a1018}
 input[type=number]{background:var(--bg);border:1px solid #1e2e42;border-radius:4px;
   color:var(--text);padding:4px 8px;font-size:12px;width:70px;font-family:inherit;outline:none}
-input[type=number]:focus{border-color:var(--ice)}
-.btn{background:none;border:1px solid var(--ice);color:var(--ice);border-radius:4px;
+input[type=number]:focus{border-color:var(--blue)}
+.btn{background:none;border:1px solid var(--blue);color:var(--blue);border-radius:4px;
   padding:6px 14px;font-size:11px;letter-spacing:1px;cursor:pointer;text-transform:uppercase;font-family:inherit}
 .btn-red{border-color:var(--red);color:var(--red)}
 .btn-green{border-color:var(--green);color:var(--green)}
@@ -618,14 +646,13 @@ input[type=number]:focus{border-color:var(--ice)}
 .logbox{background:#060a0e;border-radius:4px;padding:12px;max-height:400px;overflow-y:auto}
 .pill-y{background:#facc1522;color:var(--yellow);border-radius:3px;padding:2px 7px;font-size:10px;font-weight:600}
 .pill-g{background:#4ade8022;color:var(--green);border-radius:3px;padding:2px 7px;font-size:10px;font-weight:600}
-.window-badge{background:#a5f3fc22;color:var(--ice);border-radius:3px;padding:2px 8px;font-size:10px;font-weight:600;letter-spacing:1px}
 </style>
 </head>
 <body>
 <header>
   <div>
-    <h1>Low Temp Tracker</h1>
-    <div class="sub" id="h-sub">Philadelphia International Airport</div>
+    <h1>KOKC &middot; Model Tracker</h1>
+    <div class="sub">Oklahoma City Will Rogers World Airport</div>
   </div>
   <div class="hright">
     <div class="stat-pill">
@@ -635,8 +662,8 @@ input[type=number]:focus{border-color:var(--ice)}
     </div>
     <div class="sp"></div>
     <div class="stat-pill">
-      <div class="lbl">Wethr Low</div>
-      <div class="val" id="h-wl" style="color:var(--ice)">--</div>
+      <div class="lbl">Wethr High</div>
+      <div class="val" id="h-wh" style="color:var(--green)">--</div>
       <div class="sub2">NWS logic</div>
     </div>
     <div class="sp"></div>
@@ -647,28 +674,29 @@ input[type=number]:focus{border-color:var(--ice)}
     </div>
     <div class="sp"></div>
     <div class="stat-pill">
-      <div class="lbl">Window</div>
-      <div style="font-size:11px;font-weight:600;color:var(--ice);margin-top:4px" id="h-window">--</div>
+      <div class="lbl">Tmr Consensus</div>
+      <div class="val" id="h-tmr" style="color:#a78bfa">--</div>
+      <div class="sub2">MAE-weighted</div>
     </div>
     <div class="sp"></div>
     <div style="display:flex;gap:6px;align-items:center">
-      <button id="btn-KPHL" onclick="switchStation('KPHL')" style="background:#1e40af;border:1px solid #3b82f6;color:#93c5fd;border-radius:4px;padding:5px 12px;font-size:11px;cursor:pointer;font-family:inherit;letter-spacing:1px">KPHL</button>
-      <button id="btn-KATL" onclick="switchStation('KATL')" style="background:none;border:1px solid #334155;color:#64748b;border-radius:4px;padding:5px 12px;font-size:11px;cursor:pointer;font-family:inherit;letter-spacing:1px">KATL</button>
-      <button id="btn-KOKC" onclick="switchStation('KOKC')" style="background:none;border:1px solid #334155;color:#64748b;border-radius:4px;padding:5px 12px;font-size:11px;cursor:pointer;font-family:inherit;letter-spacing:1px">KOKC</button>
+      <button id="btn-KOKC" onclick="switchStation('KOKC')" style="background:#1e40af;border:1px solid #3b82f6;color:#93c5fd;border-radius:4px;padding:5px 12px;font-size:11px;cursor:pointer;font-family:inherit;letter-spacing:1px">KOKC</button>
+      <button id="btn-KPHL" onclick="switchStation('KPHL')" style="background:none;border:1px solid #334155;color:#64748b;border-radius:4px;padding:5px 12px;font-size:11px;cursor:pointer;font-family:inherit;letter-spacing:1px">KPHL</button>
+      
     </div>
     <div class="sp"></div>
     <div style="text-align:right">
       <div style="display:flex;align-items:center;gap:6px;font-size:10px;color:var(--dim)">
         <span class="dot dot-yellow" id="sdot"></span><span id="stxt">Loading...</span>
       </div>
-      <div style="font-size:10px;color:var(--dimmer);margin-top:3px">Next: <span id="cnt">20:00</span></div>
+      <div style="font-size:10px;color:var(--dimmer);margin-top:3px">Next: <span id="cnt">5:00</span></div>
       <button class="btn" style="margin-top:4px;padding:3px 10px;font-size:10px" onclick="manualRefresh()">&#8635; NOW</button>
     </div>
   </div>
 </header>
 
 <nav>
-  <button class="active" onclick="showTab('dashboard',this)">&#127771; Dashboard</button>
+  <button class="active" onclick="showTab('dashboard',this)">&#128202; Dashboard</button>
   <button onclick="showTab('entry',this)">&#9728;&#65039; Morning Entry</button>
   <button onclick="showTab('runs',this)">&#128336; Run Accuracy</button>
   <button onclick="showTab('log',this)">&#128319; Log</button>
@@ -683,21 +711,21 @@ input[type=number]:focus{border-color:var(--ice)}
 <div class="tab active" id="tab-dashboard">
   <div class="srow">
     <div class="sc"><div class="lbl">Current Temp</div><div class="v" id="s-obs" style="color:var(--yellow)">--</div><div class="s" id="s-obs-t">awaiting</div></div>
-    <div class="sc"><div class="lbl">Wethr Low</div><div class="v" id="s-wl" style="color:var(--ice)">--</div><div class="s">NWS logic</div></div>
-    <div class="sc"><div class="lbl">Consensus Low</div><div class="v" id="s-con" style="color:var(--blue)">--</div><div class="s">MAE-weighted adj</div></div>
+    <div class="sc"><div class="lbl">Wethr High</div><div class="v" id="s-wh" style="color:var(--green)">--</div><div class="s">NWS trading day</div></div>
+    <div class="sc"><div class="lbl">Consensus High</div><div class="v" id="s-con" style="color:var(--blue)">--</div><div class="s">MAE-weighted adj</div></div>
     <div class="sc"><div class="lbl">Models Live</div><div class="v" id="s-mods" style="color:var(--purple)">--</div><div class="s">forecast runs</div></div>
-    <div class="sc"><div class="lbl">Target Window</div><div style="font-size:12px;font-weight:600;color:var(--ice);margin-top:6px" id="s-window">--</div></div>
+    <div class="sc"><div class="lbl">Tmr Consensus</div><div class="v" id="s-tmr" style="color:#a78bfa">--</div><div class="s">MAE-weighted adj</div></div>
   </div>
 
   <div class="card">
     <div class="ctitle">
-      Today's Models &mdash; Low Forecasts + Accuracy Adjustments
+      Top 10 Models &mdash; Live Forecasts + Accuracy Adjustments
       <span class="pill-y" id="acc-badge" style="display:none">Enter accuracy in Morning Entry</span>
       <span class="pill-g" id="acc-loaded" style="display:none">Accuracy loaded</span>
     </div>
     <div style="overflow-x:auto">
       <table>
-        <thead><tr><th>#</th><th>Model</th><th>Run</th><th>Fcst Low</th><th>Correction</th><th>Adj Low</th><th>Obs Pace</th><th>Low Time</th><th>MAE</th><th>RMSE</th></tr></thead>
+        <thead><tr><th>#</th><th>Model</th><th>Run</th><th>Fcst High</th><th>Correction</th><th>Adj High</th><th>Obs Pace</th><th>Tmr High</th><th>Tmr Adj</th><th>Tmr Low</th><th>Low Adj</th><th>Low Time</th><th>MAE</th><th>RMSE</th></tr></thead>
         <tbody id="main-tbody"></tbody>
       </table>
     </div>
@@ -706,22 +734,22 @@ input[type=number]:focus{border-color:var(--ice)}
   <div class="card" id="pace-card" style="display:none">
     <div class="ctitle">Model Pacing vs Current Obs (<span id="pace-obs">--</span>F)</div>
     <div class="pbars" id="pbars"></div>
-    <div style="font-size:10px;color:var(--dimmer);margin-top:10px">Pace = current obs minus model forecast for this hour. Negative = model running warm (forecasting too high).</div>
+    <div style="font-size:10px;color:var(--dimmer);margin-top:10px">Pace = current obs minus model forecast for this hour</div>
   </div>
 
   <div class="card" id="cons-pace-card" style="display:none">
     <div class="ctitle">MAE-Weighted Consensus Pace</div>
     <div style="display:flex;align-items:baseline;gap:12px;flex-wrap:wrap">
       <div style="font-size:32px;font-weight:700" id="cons-pace-val">--</div>
-      <div style="color:var(--dim);font-size:12px;line-height:1.6">MAE-weighted average of all model obs paces.<br>Apply to consensus low at your discretion.</div>
+      <div style="color:var(--dim);font-size:12px;line-height:1.6">MAE-weighted average of all model obs paces.<br>Apply to consensus high at your discretion.</div>
     </div>
     <div style="margin-top:10px;font-size:11px;color:var(--dim)">
-      Implied adjusted low: <span id="cons-pace-implied" style="color:var(--ice);font-weight:600">--</span>
+      Implied adjusted high: <span id="cons-pace-implied" style="color:var(--green);font-weight:600">--</span>
     </div>
   </div>
 
   <div class="card" id="avg-pace-card">
-    <div class="ctitle">Today's Rolling Average Pace</div>
+    <div class="ctitle">Today's Rolling Average Pace (since 1AM)</div>
     <div style="overflow-x:auto">
       <table>
         <thead><tr><th>Model</th><th>Avg Pace</th><th>Snapshots</th></tr></thead>
@@ -734,13 +762,23 @@ input[type=number]:focus{border-color:var(--ice)}
     <div class="ctitle">Previous 3 Days Average Pace</div>
     <div style="overflow-x:auto"><table><thead id="prev-days-thead"></thead><tbody id="prev-days-tbody"><tr><td style="color:var(--dim)">No history yet</td></tr></tbody></table></div>
   </div>
+
+  <div class="card" id="nws-card" style="display:none">
+    <div class="ctitle">NWS Forecast Versions</div>
+    <div style="overflow-x:auto">
+      <table>
+        <thead><tr><th>Version</th><th>Fcst High</th><th>Adj High</th><th>Current Fcst</th><th>Obs Pace</th></tr></thead>
+        <tbody id="nws-tbody"></tbody>
+      </table>
+    </div>
+  </div>
 </div>
 
 <!-- MORNING ENTRY -->
 <div class="tab" id="tab-entry">
   <div class="card" style="border-color:#1e3a5f">
     <div class="ctitle">Fast Import &mdash; Paste JSON from Claude</div>
-    <p style="color:var(--dim);font-size:12px;line-height:1.7;margin-bottom:12px">Each morning: paste JSON for today's selected models. The model set updates automatically — add or remove models any day.</p>
+    <p style="color:var(--dim);font-size:12px;line-height:1.7;margin-bottom:12px">Each morning: screenshot accuracy tables, send to Claude, paste JSON here.</p>
     <textarea id="json-paste" placeholder="Paste JSON here..." style="width:100%;height:110px;background:#060a0e;border:1px solid #1e3a5f;border-radius:4px;color:var(--text);padding:10px;font-family:inherit;font-size:11px;resize:vertical;outline:none"></textarea>
     <div style="display:flex;gap:10px;align-items:center;margin-top:10px;flex-wrap:wrap">
       <button class="btn" onclick="loadFromJSON()">Load JSON</button>
@@ -801,33 +839,33 @@ input[type=number]:focus{border-color:var(--ice)}
 <div class="tab" id="tab-history">
   <div class="card">
     <div class="ctitle">Daily Pacing History</div>
-    <p style="color:var(--dim);font-size:11px;margin-bottom:12px">Average pace per model for each completed low period.</p>
+    <p style="color:var(--dim);font-size:11px;margin-bottom:12px">Average pace per model for each completed day. Positive = ran warmer than model forecast.</p>
     <div style="overflow-x:auto"><table><thead id="hist-thead"></thead><tbody id="hist-tbody"></tbody></table></div>
     <div style="font-size:10px;color:var(--dimmer);margin-top:10px" id="hist-count"></div>
   </div>
 </div>
 
-<!-- SNAPSHOTS -->
+<!-- SNAPSHOTS TAB -->
 <div class="tab" id="tab-snapshots">
   <div class="card">
-    <div class="ctitle">Today's Consensus Low Snapshots</div>
+    <div class="ctitle">Today&#39;s Consensus High Snapshots <span style="color:var(--dim);font-size:10px">(every 30 min, 6AM-10PM)</span></div>
     <div style="overflow-x:auto">
       <table>
-        <thead><tr><th>Time</th><th>Consensus Low</th><th>Implied Adj Low</th><th>Pace Adj</th><th>Obs</th></tr></thead>
+        <thead><tr><th>Time</th><th>Consensus High</th><th>Implied Adj High</th><th>Pace Adj</th><th>Obs</th></tr></thead>
         <tbody id="snap-tbody"><tr><td colspan="5" style="color:var(--dim)">No snapshots yet today.</td></tr></tbody>
       </table>
     </div>
   </div>
   <div class="card">
     <div class="ctitle">Historical Consensus Snapshots</div>
-    <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px">
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
       <select id="snap-date-select" style="background:var(--bg);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:4px;font-family:inherit;font-size:12px" onchange="loadSnapshotDate()">
         <option value="">Select date...</option>
       </select>
     </div>
     <div style="overflow-x:auto">
       <table>
-        <thead><tr><th>Time</th><th>Consensus Low</th><th>Implied Adj Low</th><th>Pace Adj</th><th>Obs</th></tr></thead>
+        <thead><tr><th>Time</th><th>Consensus High</th><th>Implied Adj High</th><th>Pace Adj</th><th>Obs</th></tr></thead>
         <tbody id="snap-hist-tbody"><tr><td colspan="5" style="color:var(--dim)">Select a date above.</td></tr></tbody>
       </table>
     </div>
@@ -838,7 +876,7 @@ input[type=number]:focus{border-color:var(--ice)}
 <!-- VERIFICATION TAB -->
 <div class="tab" id="tab-verification">
   <div class="card" style="border-color:#1e3a5f">
-    <div class="ctitle">Enter Previous Day Actual Low</div>
+    <div class="ctitle">Enter Previous Day Actual High</div>
     <p style="color:var(--dim);font-size:12px;line-height:1.7;margin-bottom:12px">Enter after the CLI report (~10-11AM). This calibrates your consensus snapshots against reality.</p>
     <div style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
       <div>
@@ -846,8 +884,8 @@ input[type=number]:focus{border-color:var(--ice)}
         <input type="date" id="verif-date" style="background:var(--bg);border:1px solid #1e2e42;border-radius:4px;color:var(--text);padding:6px 10px;font-family:inherit;font-size:12px;outline:none">
       </div>
       <div>
-        <div style="font-size:10px;color:var(--dim);letter-spacing:1px;margin-bottom:4px">ACTUAL LOW (°F)</div>
-        <input type="number" step="0.1" id="verif-actual" placeholder="e.g. 58.2" style="width:120px;background:var(--bg);border:1px solid #1e2e42;border-radius:4px;color:var(--text);padding:6px 10px;font-family:inherit;font-size:12px;outline:none">
+        <div style="font-size:10px;color:var(--dim);letter-spacing:1px;margin-bottom:4px">ACTUAL HIGH (°F)</div>
+        <input type="number" step="0.1" id="verif-actual" placeholder="e.g. 94.1" style="width:120px;background:var(--bg);border:1px solid #1e2e42;border-radius:4px;color:var(--text);padding:6px 10px;font-family:inherit;font-size:12px;outline:none">
       </div>
       <button class="btn btn-green" onclick="submitVerification()">Save</button>
       <span style="font-size:10px;color:var(--dim)" id="verif-status"></span>
@@ -875,16 +913,16 @@ input[type=number]:focus{border-color:var(--ice)}
 </main>
 
 <script>
-var STATION = localStorage.getItem("active_station_lows") || "KPHL";
+var STATION = localStorage.getItem("active_station") || "KOKC";
 var MODELS = [];
 var accData = {};
-try { accData = JSON.parse(localStorage.getItem("acc_lows_"+STATION) || "{}"); } catch(e){}
+try { accData = JSON.parse(localStorage.getItem("acc_"+STATION) || "{}"); } catch(e){}
 if(Object.keys(accData).length) MODELS = Object.keys(accData).filter(function(m){ return m !== "NWS"; });
-var countdown = 1200;
+var countdown = 300;
 var countdownTimer;
 
 function clearDisplay(){
-  ["h-obs","h-wl","h-con","s-obs","s-wl","s-con"].forEach(function(id){
+  ["h-obs","h-wh","h-con","h-tmr","s-obs","s-wh","s-con","s-tmr"].forEach(function(id){
     var el = document.getElementById(id); if(el) el.textContent="--";
   });
   ["h-obs-t","s-obs-t"].forEach(function(id){
@@ -893,16 +931,18 @@ function clearDisplay(){
   var tbody = document.getElementById("main-tbody"); if(tbody) tbody.innerHTML="";
   var pbars = document.getElementById("pbars"); if(pbars) pbars.innerHTML="";
   var pace = document.getElementById("pace-card"); if(pace) pace.style.display="none";
+  var avg = document.getElementById("avg-pace-tbody");
+  if(avg) avg.innerHTML='<tr><td colspan="3" style="color:var(--dim)">Accumulating...</td></tr>';
   document.getElementById("stxt").textContent="Switching...";
 }
 
 function switchStation(s){
   STATION = s;
-  localStorage.setItem("active_station_lows", s);
+  localStorage.setItem("active_station", s);
   clearDisplay();
-  try { accData = JSON.parse(localStorage.getItem("acc_lows_"+s) || "{}"); } catch(e){ accData = {}; }
+  try { accData = JSON.parse(localStorage.getItem("acc_"+s) || "{}"); } catch(e){ accData = {}; }
   MODELS = Object.keys(accData).filter(function(m){ return m !== "NWS"; });
-  ["KPHL","KATL","KOKC"].forEach(function(st){
+  ["KOKC","KPHL"].forEach(function(st){
     var btn = document.getElementById("btn-"+st);
     if(st === s){
       btn.style.background="#1e40af"; btn.style.borderColor="#3b82f6"; btn.style.color="#93c5fd";
@@ -910,8 +950,9 @@ function switchStation(s){
       btn.style.background="none"; btn.style.borderColor="#334155"; btn.style.color="#64748b";
     }
   });
-  var names = {"KPHL":"Philadelphia International Airport","KATL":"Atlanta Hartsfield-Jackson Airport","KOKC":"Oklahoma City Will Rogers World Airport"};
-  document.getElementById("h-sub").textContent = names[s] || s;
+  var names = {"KOKC":"Oklahoma City Will Rogers World Airport","KPHL":"Philadelphia International Airport",};
+  document.querySelector(".sub").textContent = names[s] || s;
+  document.querySelector("h1").textContent = s + " \u00b7 Model Tracker";
   buildForms(); renderPreview(); poll();
 }
 
@@ -977,8 +1018,8 @@ function loadFromJSON(){
     if(!keys.length){ status.style.color="var(--red)"; status.textContent="No models found."; return; }
     accData = parsed;
     MODELS = keys.filter(function(m){ return m !== "NWS"; });
-    localStorage.setItem("acc_lows_"+STATION, JSON.stringify(parsed));
-    localStorage.setItem("acc_lows_"+STATION+"_time", new Date().toLocaleString());
+    localStorage.setItem("acc_"+STATION, JSON.stringify(parsed));
+    localStorage.setItem("acc_"+STATION+"_time", new Date().toLocaleString());
     fetch("/api/accuracy?station="+STATION,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(parsed)})
       .then(function(r){
         if(!r.ok) throw new Error("HTTP "+r.status);
@@ -1009,11 +1050,14 @@ function saveAccuracy(){
     MANUAL_RUNS.forEach(function(r){
       var mae_el = document.getElementById("rm-mae-"+m+"-"+r);
       var corr_el = document.getElementById("rm-corr-"+m+"-"+r);
-      data[m].runs[r] = { mae: mae_el ? mae_el.value : "", correction: corr_el ? corr_el.value : "" };
+      data[m].runs[r] = {
+        mae: mae_el ? mae_el.value : "",
+        correction: corr_el ? corr_el.value : ""
+      };
     });
   });
   accData = data;
-  localStorage.setItem("acc_lows_"+STATION, JSON.stringify(data));
+  localStorage.setItem("acc_"+STATION, JSON.stringify(data));
   fetch("/api/accuracy?station="+STATION,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)})
     .then(function(){ document.getElementById("save-status").textContent="Saved "+new Date().toLocaleTimeString(); });
 }
@@ -1021,7 +1065,7 @@ function saveAccuracy(){
 function clearAccuracy(){
   if(!confirm("Clear all accuracy data?")) return;
   accData = {}; MODELS = [];
-  localStorage.removeItem("acc_lows_"+STATION); localStorage.removeItem("acc_lows_"+STATION+"_time");
+  localStorage.removeItem("acc_"+STATION); localStorage.removeItem("acc_"+STATION+"_time");
   fetch("/api/accuracy?station="+STATION,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({})});
   buildForms(); renderPreview();
   document.getElementById("save-status").textContent="Cleared";
@@ -1034,7 +1078,7 @@ function renderPreview(){
   document.getElementById("acc-loaded").style.display = hasAny ? "inline" : "none";
   if(!hasAny){ el.style.display="none"; return; }
   el.style.display="block";
-  var t = localStorage.getItem("acc_lows_"+STATION+"_time");
+  var t = localStorage.getItem("acc_"+STATION+"_time");
   if(t) document.getElementById("acc-loaded-time").textContent="Loaded: "+t;
   var mods = Object.keys(accData);
   document.getElementById("prev-tbody").innerHTML = mods.map(function(m,i){
@@ -1053,7 +1097,7 @@ function renderPreview(){
 function render(data){
   if(data.models && data.models.length) MODELS = data.models.filter(function(m){ return m!=="NWS"; });
   var obs = data.obs;
-  var wl = data.wethr_low;
+  var wh = data.wethr_high;
   var rows = data.rows||[];
   var con = data.consensus;
   if(obs){
@@ -1065,35 +1109,29 @@ function render(data){
     document.getElementById("s-obs-t").textContent = ot;
     document.getElementById("pace-obs").textContent = t;
   }
-  if(wl && wl.wethr_low != null){
-    document.getElementById("h-wl").textContent = wl.wethr_low+"F";
-    document.getElementById("s-wl").textContent = wl.wethr_low+"F";
-  }
-  if(con){
-    document.getElementById("h-con").textContent = con+"F";
-    document.getElementById("s-con").textContent = con+"F";
-  }
-  if(data.window_label){
-    document.getElementById("h-window").textContent = data.window_label;
-    document.getElementById("s-window").textContent = data.window_label;
-  }
-  document.getElementById("s-mods").textContent = rows.filter(function(r){ return r.raw_low!=null; }).length+"/"+rows.length;
-
+  if(wh){ document.getElementById("h-wh").textContent=wh.wethr_high+"F"; document.getElementById("s-wh").textContent=wh.wethr_high+"F"; }
+  if(con){ document.getElementById("h-con").textContent=con+"F"; document.getElementById("s-con").textContent=con+"F"; }
+  var tmrCon = data.tmr_consensus;
+  if(tmrCon){ document.getElementById("h-tmr").textContent=tmrCon+"F"; document.getElementById("s-tmr").textContent=tmrCon+"F"; }
+  document.getElementById("s-mods").textContent = rows.filter(function(r){ return r.raw_high!=null; }).length+"/"+rows.length;
   document.getElementById("main-tbody").innerHTML = rows.map(function(r,i){
     var bg = i%2?"background:#0a1018":"";
     return '<tr style="'+bg+'">'
       +'<td style="color:var(--dim)">#'+r.rank+'</td>'
       +'<td style="color:#e8f0f8;font-weight:600">'+r.model+'</td>'
       +'<td style="color:var(--dim);font-size:11px">'+(r.run||"--")+'</td>'
-      +'<td style="color:var(--ice)">'+(r.raw_low!=null?r.raw_low+"F":"--")+'</td>'
-      +'<td style="color:'+corrColor(r.correction)+'">'+(r.correction!=null&&r.correction!==""?fmtC(r.correction)+(r.corr_source==="run"?' <span style="font-size:9px;color:#38bdf8">R</span>':''):"--")+'</td>'
-      +'<td style="color:var(--blue);font-weight:600">'+(r.adj_low!=null?r.adj_low+"F":"--")+'</td>'
+      +'<td style="color:var(--yellow)">'+(r.raw_high!=null?r.raw_high+"F":"--")+'</td>'
+      +'<td style="color:'+corrColor(r.correction)+'">'+(r.correction!=null&&r.correction!==""?fmtC(r.correction)+(r.corr_source==="run"?' <span style="font-size:9px;color:#38bdf8" title="Run-specific correction">R</span>':''):"--")+'</td>'
+      +'<td style="color:var(--green);font-weight:600">'+(r.adj_high!=null?r.adj_high+"F":"--")+'</td>'
       +'<td style="color:'+(r.pace!=null?paceColor(r.pace):"#1e2e42")+'">'+(r.pace!=null?(r.pace>=0?"+":"")+r.pace+"F":"--")+'</td>'
-      +'<td style="color:var(--dim);font-size:11px">'+(r.low_time||"--")+'</td>'
+      +'<td style="color:#a78bfa">'+(r.tmr_high!=null?r.tmr_high+"F":"--")+'</td>'
+      +'<td style="color:#c4b5fd;font-weight:600">'+(r.tmr_adj!=null?r.tmr_adj+"F":"--")+'</td>'
+      +'<td style="color:#60a5fa">'+(r.tmr_low!=null?r.tmr_low+"F":"--")+'</td>'
+      +'<td style="color:#93c5fd;font-weight:600">'+(r.tmr_low_adj!=null?r.tmr_low_adj+"F":"--")+'</td>'
+      +'<td style="color:var(--dim);font-size:11px">'+(r.tmr_low_time||"--")+'</td>'
       +'<td style="color:'+maeColor(r.mae)+'">'+(r.mae?fmt1(r.mae)+"F":"--")+'</td>'
       +'<td style="color:var(--dim)">'+(r.rmse?fmt1(r.rmse)+"F":"--")+'</td></tr>';
   }).join("");
-
   var paceRows = rows.filter(function(r){ return r.pace!=null; });
   if(paceRows.length && obs){
     document.getElementById("pace-card").style.display="block";
@@ -1105,7 +1143,35 @@ function render(data){
         +'<span style="font-size:11px;color:'+paceColor(r.pace)+';font-weight:600">'+(p>=0?"+":"")+r.pace+'F</span></div>';
     }).join("");
   }
-
+  var nws = data.nws_versions||{};
+  var nwsKeys = Object.keys(nws);
+  var nwsCard = document.getElementById("nws-card");
+  if(nwsKeys.length){
+    nwsCard.style.display="block";
+    var nwsAcc = accData["NWS"]||{};
+    var nwsCorr = (nwsAcc.correction!=null&&nwsAcc.correction!=="") ? Number(nwsAcc.correction) : null;
+    var obsT = obs ? Number(obs.temperature_display) : null;
+    nwsKeys.sort(function(a,b){
+      if(a==="current") return -1; if(b==="current") return 1;
+      return (parseInt(b.replace("v",""))||0)-(parseInt(a.replace("v",""))||0);
+    });
+    document.getElementById("nws-tbody").innerHTML = nwsKeys.map(function(ver,i){
+      var v = nws[ver];
+      var adj = (v.high!=null&&nwsCorr!=null) ? (v.high+nwsCorr).toFixed(1) : null;
+      var pace = (obsT!=null&&v.current_fcst!=null) ? (obsT-v.current_fcst).toFixed(1) : null;
+      var vc = ver==="current"?"var(--green)":"var(--blue)";
+      var vl = ver==="current"?"Current":ver.toUpperCase();
+      var pc = pace!=null?paceColor(pace):"#1e2e42";
+      var ps = pace!=null?(Number(pace)>=0?"+":"")+pace+"F":"--";
+      var bg = i%2?"background:#0a1018":"";
+      return '<tr style="'+bg+'">'
+        +'<td style="color:'+vc+';font-weight:600">'+vl+'</td>'
+        +'<td style="color:var(--yellow)">'+(v.high!=null?v.high+"F":"--")+'</td>'
+        +'<td style="color:var(--green)">'+(adj?adj+"F":"--")+'</td>'
+        +'<td style="color:#94a3b8">'+(v.current_fcst!=null?v.current_fcst+"F":"--")+'</td>'
+        +'<td style="color:'+pc+'">'+ps+'</td></tr>';
+    }).join("");
+  } else { nwsCard.style.display="none"; }
   document.getElementById("runview-tbody").innerHTML = rows.map(function(r,i){
     var bg = i%2?"background:#0a1018":"";
     var cells = MANUAL_RUNS.map(function(run){
@@ -1118,26 +1184,23 @@ function render(data){
     }).join("");
     return '<tr style="'+bg+'"><td style="color:#e8f0f8;font-weight:600">'+r.model+'</td>'+cells+'</tr>';
   }).join("");
-
   document.getElementById("run-cards").innerHTML = rows.map(function(r){
     var runKey = r.run ? r.run.replace(/[^0-9]/g,"").slice(0,2)+"Z" : "";
     var rd = (r.runs||{})[runKey]||{};
     var hasC = rd.correction!=null&&rd.correction!=="";
     return '<div style="background:#0b1520;border:1px solid var(--border);border-radius:5px;padding:8px 12px;min-width:120px">'
       +'<div style="font-size:11px;color:#8aabcc;font-weight:600">'+r.model+'</div>'
-      +'<div style="font-size:13px;color:var(--ice);margin-top:2px">'+(r.run||"--")+'</div>'
+      +'<div style="font-size:13px;color:var(--blue);margin-top:2px">'+(r.run||"--")+'</div>'
       +(hasC?'<div style="font-size:11px;color:'+corrColor(rd.correction)+';margin-top:2px">Corr: '+fmtC(rd.correction)+'</div>'
              :'<div style="font-size:10px;color:#2a4060;margin-top:2px">No run corr</div>')
       +'</div>';
   }).join("");
-
   if(data.log&&data.log.length){
     document.getElementById("logbox").innerHTML = data.log.map(function(e){
       var col = e.level==="ok"?"var(--green)":e.level==="err"?"var(--red)":e.level==="warn"?"var(--yellow)":"var(--dim)";
       return '<div style="margin-bottom:5px"><span style="color:var(--dimmer)">['+e.t+']</span> <span style="color:'+col+'">'+e.msg+'</span></div>';
     }).join("");
   }
-
   var consPace = data.consensus_pace;
   var consPaceCard = document.getElementById("cons-pace-card");
   if(consPace != null && obs){
@@ -1148,7 +1211,6 @@ function render(data){
     var implied = con ? (Math.round((parseFloat(con) + consPace) * 10) / 10) + "F" : "--";
     document.getElementById("cons-pace-implied").textContent = implied;
   } else { consPaceCard.style.display = "none"; }
-
   var avgPace = data.today_avg_pace || {};
   var avgModels = Object.keys(avgPace);
   var todaySnaps = data.today_snapshot_count || 0;
@@ -1156,14 +1218,14 @@ function render(data){
     document.getElementById("avg-pace-tbody").innerHTML = avgModels.map(function(m,i){
       var p = avgPace[m];
       var bg = i%2?"background:#0a1018":"";
+      var pc = paceColor(p);
       return '<tr style="'+bg+'"><td style="color:#e8f0f8;font-weight:600">'+m+'</td>'
-        +'<td style="color:'+paceColor(p)+';font-weight:600">'+(p>=0?"+":"")+p.toFixed(2)+'F</td>'
+        +'<td style="color:'+pc+';font-weight:600">'+(p>=0?"+":"")+p.toFixed(2)+'F</td>'
         +'<td style="color:var(--dim)">'+todaySnaps+'</td></tr>';
     }).join("");
   } else {
-    document.getElementById("avg-pace-tbody").innerHTML = '<tr><td colspan="3" style="color:var(--dim)">Accumulating — updates every 20 min</td></tr>';
+    document.getElementById("avg-pace-tbody").innerHTML = '<tr><td colspan="3" style="color:var(--dim)">Accumulating — updates every 5 min</td></tr>';
   }
-
   var prevDays = data.prev_days || [];
   if(prevDays.length){
     var allModels = [];
@@ -1182,7 +1244,6 @@ function render(data){
     document.getElementById("prev-days-thead").innerHTML = '';
     document.getElementById("prev-days-tbody").innerHTML = '<tr><td style="color:var(--dim)">No history yet — builds after first full day</td></tr>';
   }
-
   document.getElementById("sdot").className = "dot "+(data.errors&&data.errors.length?"dot-yellow":"dot-green");
   document.getElementById("stxt").textContent = data.last_updated?"Updated "+data.last_updated.slice(11,16):"Live";
 }
@@ -1196,7 +1257,7 @@ function poll(){
 
 function manualRefresh(){
   fetch("/api/refresh?station="+STATION,{method:"POST"});
-  countdown=1200;
+  countdown=300;
   document.getElementById("stxt").textContent="Fetching...";
   setTimeout(poll,8000);
   setTimeout(poll,15000);
@@ -1204,16 +1265,16 @@ function manualRefresh(){
 
 function startCountdown(){
   clearInterval(countdownTimer);
-  countdown=1200;
+  countdown=300;
   countdownTimer=setInterval(function(){
     countdown=Math.max(0,countdown-1);
     var m=Math.floor(countdown/60); var s=String(countdown%60).padStart(2,"0");
     document.getElementById("cnt").textContent=m+":"+s;
-    if(countdown===0){ poll(); countdown=1200; }
+    if(countdown===0){ poll(); countdown=300; }
   },1000);
 }
 
-buildForms(); renderPreview(); poll(); startCountdown(); setInterval(poll,1200000);
+buildForms(); renderPreview(); poll(); startCountdown(); setInterval(poll,300000);
 
 document.addEventListener("visibilitychange", function(){
   if(document.visibilityState === "visible"){ poll(); }
@@ -1221,6 +1282,7 @@ document.addEventListener("visibilitychange", function(){
 window.addEventListener("focus", function(){ poll(); });
 
 var _snapData = {};
+
 function loadSnapshots(){
   fetch("/api/consensus_snapshots?station="+STATION)
     .then(function(r){ return r.json(); })
@@ -1231,12 +1293,12 @@ function loadSnapshots(){
       if(today.length){
         tbody.innerHTML = today.slice().reverse().map(function(s,i){
           var bg = i%2?"background:#0a1018":"";
-          var pc = s.pace!=null?(s.pace>=0?"var(--green)":"var(--red)"):"var(--dim)";
+          var pc = s.pace!=null?(s.pace>=0?"var(--red)":"var(--green)"):"var(--dim)";
           var paceStr = s.pace!=null?(s.pace>=0?"+":"")+s.pace+"F":"--";
           return '<tr style="'+bg+'">'
             +'<td style="color:var(--dim)">'+s.time+'</td>'
             +'<td style="color:var(--blue);font-weight:600">'+(s.consensus!=null?s.consensus+"F":"--")+'</td>'
-            +'<td style="color:var(--ice);font-weight:600">'+(s.implied!=null?s.implied+"F":"--")+'</td>'
+            +'<td style="color:var(--green);font-weight:600">'+(s.implied!=null?s.implied+"F":"--")+'</td>'
             +'<td style="color:'+pc+'">'+paceStr+'</td>'
             +'<td style="color:var(--yellow)">'+(s.obs!=null?s.obs+"F":"--")+'</td>'
             +'</tr>';
@@ -1261,12 +1323,12 @@ function loadSnapshotDate(){
   var snaps = _snapData[date].slice().reverse();
   tbody.innerHTML = snaps.map(function(s,i){
     var bg = i%2?"background:#0a1018":"";
-    var pc = s.pace!=null?(s.pace>=0?"var(--green)":"var(--red)"):"var(--dim)";
+    var pc = s.pace!=null?(s.pace>=0?"var(--red)":"var(--green)"):"var(--dim)";
     var paceStr = s.pace!=null?(s.pace>=0?"+":"")+s.pace+"F":"--";
     return '<tr style="'+bg+'">'
       +'<td style="color:var(--dim)">'+s.time+'</td>'
       +'<td style="color:var(--blue);font-weight:600">'+(s.consensus!=null?s.consensus+"F":"--")+'</td>'
-      +'<td style="color:var(--ice);font-weight:600">'+(s.implied!=null?s.implied+"F":"--")+'</td>'
+      +'<td style="color:var(--green);font-weight:600">'+(s.implied!=null?s.implied+"F":"--")+'</td>'
       +'<td style="color:'+pc+'">'+paceStr+'</td>'
       +'<td style="color:var(--yellow)">'+(s.obs!=null?s.obs+"F":"--")+'</td>'
       +'</tr>';
@@ -1280,7 +1342,7 @@ function loadHistory(){
     var tbody = document.getElementById("hist-tbody");
     var countEl = document.getElementById("hist-count");
     if(!dates.length){
-      tbody.innerHTML = '<tr><td colspan="2" style="color:var(--dim)">No history yet.</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="2" style="color:var(--dim)">No history yet. Data accumulates after the first full day.</td></tr>';
       return;
     }
     var allModels = [];
@@ -1306,6 +1368,7 @@ document.querySelectorAll("nav button").forEach(function(btn){
 });
 
 function loadVerification(){
+  // Set default date to yesterday
   var d = new Date(); d.setDate(d.getDate()-1);
   var ds = d.toISOString().slice(0,10);
   document.getElementById("verif-date").value = ds;
@@ -1323,13 +1386,14 @@ function loadVerification(){
         var cal = v.calibration || [];
         var avgErr = cal.length ? round1(cal.reduce(function(a,b){ return a+b.error; },0)/cal.length) : "--";
         var avgAbs = cal.length ? round1(cal.reduce(function(a,b){ return a+b.abs_error; },0)/cal.length) : "--";
+        // Best snapshot = smallest abs error
         var best = cal.length ? cal.reduce(function(a,b){ return a.abs_error < b.abs_error ? a : b; }) : null;
         var bestStr = best ? best.time+" ("+fmtC(best.error)+")" : "--";
         var bg = i%2?"background:#0a1018":"";
         var ec = typeof avgErr === "number" ? corrColor(avgErr) : "var(--dim)";
         return '<tr style="'+bg+'">'
           +'<td style="color:#e8f0f8">'+d+'</td>'
-          +'<td style="color:var(--ice)">'+v.actual+'F</td>'
+          +'<td style="color:var(--yellow)">'+v.actual+'F</td>'
           +'<td style="color:var(--dim)">'+v.snapshot_count+'</td>'
           +'<td style="color:'+ec+'">'+(typeof avgErr==="number"?(avgErr>=0?"+":"")+avgErr+"F":"--")+'</td>'
           +'<td style="color:'+maeColor(avgAbs)+'">'+(typeof avgAbs==="number"?avgAbs+"F":"--")+'</td>'
@@ -1343,16 +1407,21 @@ function submitVerification(){
   var date = document.getElementById("verif-date").value;
   var actual = document.getElementById("verif-actual").value;
   var status = document.getElementById("verif-status");
-  if(!date || !actual){ status.style.color="var(--red)"; status.textContent="Date and actual required."; return; }
+  if(!actual){ status.style.color="var(--red)"; status.textContent="Actual value required."; return; }
+  if(!date || date.length < 8){
+    var d2 = new Date(); d2.setDate(d2.getDate()-1);
+    date = d2.toISOString().slice(0,10);
+  }
   fetch("/api/verify?station="+STATION,{
     method:"POST",
     headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({date:date, actual:parseFloat(actual), metric:"low"})
+    body:JSON.stringify({date:date, actual:parseFloat(actual), metric:"high"})
   }).then(function(r){ return r.json(); })
   .then(function(data){
     if(data.ok){
       status.style.color="var(--green)";
       status.textContent = "Saved. "+data.calibration_points+" snapshots calibrated.";
+      // Show results
       fetch("/api/verification?station="+STATION)
         .then(function(r){ return r.json(); })
         .then(function(verif){
@@ -1365,7 +1434,7 @@ function submitVerification(){
               return '<tr style="'+bg+'">'
                 +'<td style="color:var(--dim)">'+c.time+'</td>'
                 +'<td style="color:var(--blue)">'+c.consensus+'F</td>'
-                +'<td style="color:var(--ice)">'+(c.implied!=null?c.implied+"F":"--")+'</td>'
+                +'<td style="color:var(--green)">'+(c.implied!=null?c.implied+"F":"--")+'</td>'
                 +'<td style="color:var(--yellow)">'+c.actual+'F</td>'
                 +'<td style="color:'+ec+'">'+(c.error>=0?"+":"")+c.error+'F</td>'
                 +'<td style="color:'+maeColor(c.abs_error)+'">'+c.abs_error+'F</td>'
@@ -1407,6 +1476,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
