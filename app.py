@@ -953,9 +953,10 @@ input[type=number]:focus{border-color:var(--ice)}
   </div>
 
   <div class="card">
-    <div class="ctitle">Top 10 Models &mdash; Standard Backup Corrections
-      <span style="font-size:10px;color:var(--dim);margin-left:10px;letter-spacing:0;text-transform:none">R = run-specific &bull; O = overall fallback</span>
+    <div class="ctitle">Active Models &mdash; Standard Backup Corrections
+      <span style="font-size:10px;color:var(--dim);margin-left:10px;letter-spacing:0;text-transform:none">R = run-specific &bull; O = overall fallback &bull; matches your loaded accuracy model set</span>
     </div>
+    <div style="font-size:11px;color:var(--yellow);margin-bottom:10px" id="stdcorr-no-models" style="display:none"></div>
     <div style="overflow-x:auto">
       <table>
         <thead><tr><th>Model</th><th>Overall Backup</th><th>00Z</th><th>03Z</th><th>06Z</th><th>09Z</th><th>12Z</th><th>15Z</th><th>18Z</th><th>21Z</th></tr></thead>
@@ -1598,7 +1599,14 @@ function updateStdCorrDateUI(savedDate){
 }
 
 function buildStdCorrTable(){
-  var mods = STD_CORR_MODELS;
+  var mods = MODELS.length ? MODELS : [];
+  var noModsEl = document.getElementById("stdcorr-no-models");
+  if(!mods.length){
+    if(noModsEl) noModsEl.textContent = "⚠ No accuracy data loaded — load your models in Morning Entry first.";
+    document.getElementById("stdcorr-tbody").innerHTML = '<tr><td colspan="10" style="color:var(--dim)">No models loaded.</td></tr>';
+    return;
+  }
+  if(noModsEl) noModsEl.textContent = "";
   var runs = ["00Z","03Z","06Z","09Z","12Z","15Z","18Z","21Z"];
   document.getElementById("stdcorr-tbody").innerHTML = mods.map(function(m,i){
     var d = stdCorrData[m]||{};
@@ -1614,7 +1622,7 @@ function buildStdCorrTable(){
 function collectStdCorrData(){
   var runs = ["00Z","03Z","06Z","09Z","12Z","15Z","18Z","21Z"];
   var out = {};
-  STD_CORR_MODELS.forEach(function(m){
+  (MODELS.length ? MODELS : []).forEach(function(m){
     var obj = {};
     var ov = document.getElementById("sc-ov-"+m);
     if(ov && ov.value!=="") obj.overall = parseFloat(ov.value);
@@ -1732,5 +1740,6 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
