@@ -412,6 +412,11 @@ def api_state():
         station = "KPHL"
     st = get_state(station)
     acc = st["accuracy"]
+    # Load accuracy from disk if not in memory (e.g. after server restart)
+    if not acc:
+        acc = load_json_file(f"{DATA_DIR}/accuracy_{station}.json", {})
+        if acc:
+            st["accuracy"] = acc
     models = active_models(station)
 
     # Load standard corrections from disk if not in memory
@@ -535,12 +540,21 @@ def api_history():
         station = "KPHL"
     return jsonify(load_json_file(f"{DATA_DIR}/history_{station}.json", {}))
 
-@app.route("/api/accuracy", methods=["POST"])
+@app.route("/api/accuracy", methods=["GET", "POST"])
 def save_accuracy():
     station = request.args.get("station", "KPHL").upper()
     if station not in STATIONS:
         station = "KPHL"
-    get_state(station)["accuracy"] = request.json or {}
+    if request.method == "GET":
+        acc = get_state(station).get("accuracy") or {}
+        if not acc:
+            acc = load_json_file(f"{DATA_DIR}/accuracy_{station}.json", {})
+            if acc:
+                get_state(station)["accuracy"] = acc
+        return jsonify(acc)
+    data = request.json or {}
+    get_state(station)["accuracy"] = data
+    save_json_file(f"{DATA_DIR}/accuracy_{station}.json", data)
     add_log("Accuracy data updated", "ok", station)
     return jsonify({"ok": True})
 
@@ -1064,7 +1078,21 @@ function switchStation(s){
   });
   var names = {"KPHL":"Philadelphia International Airport","KATL":"Atlanta Hartsfield-Jackson Airport","KOKC":"Oklahoma City Will Rogers World Airport"};
   document.getElementById("h-sub").textContent = names[s] || s;
-  buildForms(); renderPreview(); poll();
+  // If localStorage is empty for this station, pull accuracy from server
+  if(!MODELS.length){
+    fetch("/api/accuracy?station="+s)
+      .then(function(r){ return r.json(); })
+      .then(function(data){
+        if(data && Object.keys(data).length){
+          accData = data;
+          MODELS = Object.keys(data).filter(function(m){ return m !== "NWS"; });
+          localStorage.setItem("acc_lows_"+s, JSON.stringify(data));
+        }
+        buildForms(); renderPreview(); poll();
+      }).catch(function(){ buildForms(); renderPreview(); poll(); });
+  } else {
+    buildForms(); renderPreview(); poll();
+  }
 }
 
 var MANUAL_RUNS = ["00Z","03Z","06Z","09Z","12Z","15Z","18Z","21Z"];
