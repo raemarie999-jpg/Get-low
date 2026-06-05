@@ -63,14 +63,17 @@ states = {s: make_state() for s in STATIONS}
 
 # Pre-load accuracy and standard corrections from disk at startup
 def _preload_states():
-    ensure_data_dir()
-    for s in STATIONS:
-        acc = load_json_file(f"{DATA_DIR}/accuracy_{s}.json", {})
-        if acc:
-            states[s]["accuracy"] = acc
-        sc = load_json_file(f"{DATA_DIR}/std_corr_{s}.json", {})
-        if sc:
-            states[s]["standard_corrections"] = sc
+    try:
+        ensure_data_dir()
+        for s in STATIONS:
+            acc = load_json_file(f"{DATA_DIR}/accuracy_{s}.json", {})
+            if acc:
+                states[s]["accuracy"] = acc
+            sc = load_json_file(f"{DATA_DIR}/std_corr_{s}.json", {})
+            if sc:
+                states[s]["standard_corrections"] = sc
+    except Exception as e:
+        print(f"Preload warning: {e}")
 _preload_states()
 
 def get_state(station=None):
@@ -1417,9 +1420,6 @@ function render(data){
 }
 
 function poll(){
-  if(Object.keys(accData).length){
-    fetch("/api/accuracy?station="+STATION,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(accData)});
-  }
   fetch("/api/state?station="+STATION).then(function(r){ return r.json(); }).then(render).catch(function(e){ console.error(e); });
 }
 
@@ -1806,6 +1806,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
