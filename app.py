@@ -7,7 +7,7 @@ app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024
 
 API_KEY = os.environ.get("WETHR_API_KEY", "")
-DATA_DIR = "/data"
+DATA_DIR = os.environ.get("DATA_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
 REFRESH_SEC = 1200  # 20 minutes
 
 def ensure_data_dir():
@@ -1806,6 +1806,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
