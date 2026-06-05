@@ -61,6 +61,18 @@ def make_state():
 
 states = {s: make_state() for s in STATIONS}
 
+# Pre-load accuracy and standard corrections from disk at startup
+def _preload_states():
+    ensure_data_dir()
+    for s in STATIONS:
+        acc = load_json_file(f"{DATA_DIR}/accuracy_{s}.json", {})
+        if acc:
+            states[s]["accuracy"] = acc
+        sc = load_json_file(f"{DATA_DIR}/std_corr_{s}.json", {})
+        if sc:
+            states[s]["standard_corrections"] = sc
+_preload_states()
+
 def get_state(station=None):
     return states.get(station or "KPHL", states["KPHL"])
 
@@ -1794,6 +1806,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
