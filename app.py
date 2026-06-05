@@ -323,14 +323,18 @@ def save_consensus_snapshot(station="KPHL"):
         run_corr = (a.get("runs") or {}).get(current_run, {}).get("correction")
         overall_corr = a.get("correction")
         corr = run_corr if run_corr not in (None, "") else overall_corr
-        # Apply standard backup correction if needed
-        if corr in (None, ""):
+        # Apply standard backup only when no run-specific correction exists
+        std_mae = None
+        if run_corr in (None, ""):
             sc_model = sc.get(model, {})
             std_run = sc_model.get(current_run)
             std_overall = sc_model.get("overall")
-            corr = std_run if std_run not in (None, "") else (std_overall if std_overall not in (None, "") else None)
+            corr = std_run if std_run not in (None, "") else (std_overall if std_overall not in (None, "") else corr)
+            if sc_model.get("std_mae") not in (None, ""):
+                try: std_mae = float(sc_model["std_mae"])
+                except: pass
         try:
-            mae = float(a.get("mae") or 0)
+            mae = std_mae if std_mae is not None else float(a.get("mae") or 0)
             adj = round(float(raw) + float(corr), 1) if raw is not None and corr not in (None, "") else None
             if mae > 0 and adj is not None:
                 w = 1/mae; w_sum += adj*w; w_total += w
@@ -338,7 +342,7 @@ def save_consensus_snapshot(station="KPHL"):
         try:
             current_fcst = fcst.get("current_fcst")
             pace = round(float(obs_temp) - float(current_fcst), 2) if obs_temp and current_fcst else None
-            mae = float(a.get("mae") or 0)
+            mae = std_mae if std_mae is not None else float(a.get("mae") or 0)
             if mae > 0 and pace is not None:
                 w = 1/mae; pw_sum += float(pace)*w; pw_total += w
         except: pass
@@ -439,13 +443,14 @@ def api_state():
         sc_model = sc.get(model, {})
         std_run_corr = sc_model.get(current_run)
         std_overall_corr = sc_model.get("overall")
-        # Pick the best available standard correction for this run
         std_corr = std_run_corr if std_run_corr not in (None, "") else (std_overall_corr if std_overall_corr not in (None, "") else None)
         std_corr_source = ("std_run" if std_run_corr not in (None, "") else ("std_overall" if std_overall_corr not in (None, "") else None))
+        try: std_mae = float(sc_model["std_mae"]) if sc_model.get("std_mae") not in (None, "") else None
+        except: std_mae = None
 
         # Apply standard as fallback only when no run-specific correction exists
         std_used = False
-        if run_corr in (None, "") and corr in (None, "") and std_corr not in (None, ""):
+        if run_corr in (None, "") and std_corr not in (None, ""):
             corr = std_corr
             corr_source = std_corr_source
             std_used = True
@@ -460,7 +465,6 @@ def api_state():
         current_fcst = fcst.get("current_fcst")
         try: pace = round(float(obs_temp) - float(current_fcst), 1) if obs_temp and current_fcst else None
         except: pace = None
-        # Fall back to run-specific MAE for display if overall is null
         display_mae = a.get("mae")
         if display_mae is None:
             run_mae = (a.get("runs") or {}).get(current_run, {}).get("mae")
@@ -476,6 +480,7 @@ def api_state():
             "std_corr": std_corr,
             "std_corr_source": std_corr_source,
             "std_adj": std_adj,
+            "std_mae": std_mae,
             "adj_low": adj, "pace": pace,
             "low_time": fcst.get("low_time"),
             "mae": display_mae, "rmse": a.get("rmse"),
@@ -789,7 +794,7 @@ input[type=number]:focus{border-color:var(--ice)}
     </div>
     <div style="overflow-x:auto">
       <table>
-        <thead><tr><th>Model</th><th>Run</th><th>Fcst Low</th><th>Run Adj Low</th><th>Std Correction</th><th>Std Adj Low</th><th>Note</th></tr></thead>
+        <thead><tr><th>Model</th><th>Run</th><th>Fcst Low</th><th>Run Adj Low</th><th>Std Correction</th><th>Std MAE</th><th>Std Adj Low</th><th>Note</th></tr></thead>
         <tbody id="std-adj-tbody"></tbody>
       </table>
     </div>
@@ -959,7 +964,7 @@ input[type=number]:focus{border-color:var(--ice)}
     <div style="font-size:11px;color:var(--yellow);margin-bottom:10px" id="stdcorr-no-models" style="display:none"></div>
     <div style="overflow-x:auto">
       <table>
-        <thead><tr><th>Model</th><th>Overall Backup</th><th>00Z</th><th>03Z</th><th>06Z</th><th>09Z</th><th>12Z</th><th>15Z</th><th>18Z</th><th>21Z</th></tr></thead>
+        <thead><tr><th>Model</th><th>Std MAE</th><th>Overall Backup</th><th>00Z</th><th>03Z</th><th>06Z</th><th>09Z</th><th>12Z</th><th>15Z</th><th>18Z</th><th>21Z</th></tr></thead>
         <tbody id="stdcorr-tbody"></tbody>
       </table>
     </div>
@@ -974,8 +979,8 @@ input[type=number]:focus{border-color:var(--ice)}
     <div class="ctitle">Currently Active Standard Corrections</div>
     <div style="overflow-x:auto">
       <table>
-        <thead><tr><th>Model</th><th>Overall</th><th>Run-Specific Entries</th></tr></thead>
-        <tbody id="stdcorr-preview-tbody"><tr><td colspan="3" style="color:var(--dim)">None loaded.</td></tr></tbody>
+        <thead><tr><th>Model</th><th>Std MAE</th><th>Overall</th><th>Run-Specific Entries</th></tr></thead>
+        <tbody id="stdcorr-preview-tbody"><tr><td colspan="4" style="color:var(--dim)">None loaded.</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -1281,6 +1286,7 @@ function render(data){
         +'<td style="color:var(--ice)">'+(r.raw_low!=null?r.raw_low+"F":"--")+'</td>'
         +runAdjCell
         +'<td style="color:'+corrColor(r.std_corr)+'">'+fmtC(r.std_corr)+stdCorrSrc+'</td>'
+        +'<td style="color:#f59e0b">'+(r.std_mae!=null?r.std_mae:"--")+'</td>'
         +'<td style="color:'+(r.std_used?"var(--purple)":"var(--dim)")+';font-weight:'+(r.std_used?"700":"400")+'">'+(r.std_adj!=null?r.std_adj+"F":"--")+'</td>'
         +noteCell
         +'</tr>';
@@ -1603,7 +1609,7 @@ function buildStdCorrTable(){
   var noModsEl = document.getElementById("stdcorr-no-models");
   if(!mods.length){
     if(noModsEl) noModsEl.textContent = "⚠ No accuracy data loaded — load your models in Morning Entry first.";
-    document.getElementById("stdcorr-tbody").innerHTML = '<tr><td colspan="10" style="color:var(--dim)">No models loaded.</td></tr>';
+    document.getElementById("stdcorr-tbody").innerHTML = '<tr><td colspan="11" style="color:var(--dim)">No models loaded.</td></tr>';
     return;
   }
   if(noModsEl) noModsEl.textContent = "";
@@ -1611,11 +1617,12 @@ function buildStdCorrTable(){
   document.getElementById("stdcorr-tbody").innerHTML = mods.map(function(m,i){
     var d = stdCorrData[m]||{};
     var bg = i%2?"background:#0a1018":"";
+    var maeCell = '<td><input type="number" step="0.01" min="0" placeholder="—" id="sc-mae-'+m+'" value="'+(d.std_mae!=null?d.std_mae:"")+'" style="width:54px;color:#f59e0b"></td>';
     var overallCell = '<td><input type="number" step="0.1" placeholder="—" id="sc-ov-'+m+'" value="'+(d.overall!=null?d.overall:"")+'" style="width:58px"></td>';
     var runCells = runs.map(function(r){
       return '<td><input type="number" step="0.1" placeholder="—" id="sc-'+m+'-'+r+'" value="'+(d[r]!=null?d[r]:"")+'" style="width:52px;font-size:11px"></td>';
     }).join("");
-    return '<tr style="'+bg+'"><td style="color:#e8f0f8;font-weight:600">'+m+'</td>'+overallCell+runCells+'</tr>';
+    return '<tr style="'+bg+'"><td style="color:#e8f0f8;font-weight:600">'+m+'</td>'+maeCell+overallCell+runCells+'</tr>';
   }).join("");
 }
 
@@ -1624,6 +1631,8 @@ function collectStdCorrData(){
   var out = {};
   (MODELS.length ? MODELS : []).forEach(function(m){
     var obj = {};
+    var mae = document.getElementById("sc-mae-"+m);
+    if(mae && mae.value!=="") obj.std_mae = parseFloat(mae.value);
     var ov = document.getElementById("sc-ov-"+m);
     if(ov && ov.value!=="") obj.overall = parseFloat(ov.value);
     runs.forEach(function(r){
@@ -1638,16 +1647,17 @@ function collectStdCorrData(){
 function renderStdCorrPreview(data){
   var mods = Object.keys(data).filter(function(k){ return !k.startsWith("_"); });
   if(!mods.length){
-    document.getElementById("stdcorr-preview-tbody").innerHTML = '<tr><td colspan="3" style="color:var(--dim)">None loaded.</td></tr>';
+    document.getElementById("stdcorr-preview-tbody").innerHTML = '<tr><td colspan="4" style="color:var(--dim)">None loaded.</td></tr>';
     return;
   }
   document.getElementById("stdcorr-preview-tbody").innerHTML = mods.map(function(m,i){
     var d = data[m]||{};
     var bg = i%2?"background:#0a1018":"";
+    var mae = d.std_mae!=null ? '<span style="color:#f59e0b;font-weight:600">'+d.std_mae+'</span>' : '<span style="color:#2a3a50">—</span>';
     var ov = d.overall!=null ? '<span style="color:'+corrColor(d.overall)+';font-weight:600">'+fmtC(d.overall)+'</span>' : '<span style="color:#2a3a50">—</span>';
-    var runs = Object.entries(d).filter(function(e){ return e[0]!=="overall"; })
+    var runs = Object.entries(d).filter(function(e){ return e[0]!=="overall" && e[0]!=="std_mae"; })
       .map(function(e){ return '<span style="color:#8aabcc">'+e[0]+':</span><span style="color:'+corrColor(e[1])+'"> '+fmtC(e[1])+'</span>'; }).join("  ");
-    return '<tr style="'+bg+'"><td style="color:#e8f0f8;font-weight:600">'+m+'</td><td>'+ov+'</td><td style="font-size:11px">'+( runs||'<span style="color:#2a3a50">—</span>')+'</td></tr>';
+    return '<tr style="'+bg+'"><td style="color:#e8f0f8;font-weight:600">'+m+'</td><td>'+mae+'</td><td>'+ov+'</td><td style="font-size:11px">'+(runs||'<span style="color:#2a3a50">—</span>')+'</td></tr>';
   }).join("");
 }
 
@@ -1740,6 +1750,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
