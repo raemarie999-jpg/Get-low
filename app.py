@@ -1430,7 +1430,23 @@ function startCountdown(){
   },1000);
 }
 
-buildForms(); renderPreview(); poll(); startCountdown(); setInterval(poll,1200000);
+// On startup, if localStorage is empty for this station fetch from server
+if(!MODELS.length){
+  fetch("/api/accuracy?station="+STATION)
+    .then(function(r){ return r.json(); })
+    .then(function(data){
+      if(data && Object.keys(data).length){
+        accData = data;
+        MODELS = Object.keys(data).filter(function(m){ return m !== "NWS"; });
+        localStorage.setItem("acc_lows_"+STATION, JSON.stringify(data));
+      }
+      buildForms(); renderPreview(); poll(); startCountdown(); setInterval(poll,1200000);
+    }).catch(function(){
+      buildForms(); renderPreview(); poll(); startCountdown(); setInterval(poll,1200000);
+    });
+} else {
+  buildForms(); renderPreview(); poll(); startCountdown(); setInterval(poll,1200000);
+}
 
 document.addEventListener("visibilitychange", function(){
   if(document.visibilityState === "visible"){ poll(); }
@@ -1778,6 +1794,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
