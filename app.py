@@ -7,7 +7,7 @@ app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024
 
 API_KEY = os.environ.get("WETHR_API_KEY", "")
-DATA_DIR = os.environ.get("DATA_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
+DATA_DIR = "/data"
 REFRESH_SEC = 1200  # 20 minutes
 
 def ensure_data_dir():
@@ -56,25 +56,9 @@ def make_state():
         "log": [],
         "today_avg_pace": {},
         "consensus_snapshots": [],
-        "standard_corrections": {},  # {model: {run: correction, "overall": correction}}
     }
 
 states = {s: make_state() for s in STATIONS}
-
-# Pre-load accuracy and standard corrections from disk at startup
-def _preload_states():
-    try:
-        ensure_data_dir()
-        for s in STATIONS:
-            acc = load_json_file(f"{DATA_DIR}/accuracy_{s}.json", {})
-            if acc:
-                states[s]["accuracy"] = acc
-            sc = load_json_file(f"{DATA_DIR}/std_corr_{s}.json", {})
-            if sc:
-                states[s]["standard_corrections"] = sc
-    except Exception as e:
-        print(f"Preload warning: {e}")
-_preload_states()
 
 def get_state(station=None):
     return states.get(station or "KPHL", states["KPHL"])
@@ -325,7 +309,6 @@ def save_consensus_snapshot(station="KPHL"):
     time_str = now.strftime("%H:%M")
     acc = st.get("accuracy", {})
     forecasts = st.get("forecasts", {})
-    sc = st.get("standard_corrections") or load_json_file(f"{DATA_DIR}/std_corr_{station}.json", {})
     models = [m for m in acc.keys() if m != "NWS"]
     w_sum, w_total = 0, 0
     pw_sum, pw_total = 0, 0
@@ -338,18 +321,8 @@ def save_consensus_snapshot(station="KPHL"):
         run_corr = (a.get("runs") or {}).get(current_run, {}).get("correction")
         overall_corr = a.get("correction")
         corr = run_corr if run_corr not in (None, "") else overall_corr
-        # Apply standard backup only when no run-specific correction exists
-        std_mae = None
-        if run_corr in (None, ""):
-            sc_model = sc.get(model, {})
-            std_run = sc_model.get(current_run)
-            std_overall = sc_model.get("overall")
-            corr = std_run if std_run not in (None, "") else (std_overall if std_overall not in (None, "") else corr)
-            if sc_model.get("std_mae") not in (None, ""):
-                try: std_mae = float(sc_model["std_mae"])
-                except: pass
         try:
-            mae = std_mae if std_mae is not None else float(a.get("mae") or 0)
+            mae = float(a.get("mae") or 0)
             adj = round(float(raw) + float(corr), 1) if raw is not None and corr not in (None, "") else None
             if mae > 0 and adj is not None:
                 w = 1/mae; w_sum += adj*w; w_total += w
@@ -357,7 +330,7 @@ def save_consensus_snapshot(station="KPHL"):
         try:
             current_fcst = fcst.get("current_fcst")
             pace = round(float(obs_temp) - float(current_fcst), 2) if obs_temp and current_fcst else None
-            mae = std_mae if std_mae is not None else float(a.get("mae") or 0)
+            mae = float(a.get("mae") or 0)
             if mae > 0 and pace is not None:
                 w = 1/mae; pw_sum += float(pace)*w; pw_total += w
         except: pass
@@ -427,19 +400,7 @@ def api_state():
         station = "KPHL"
     st = get_state(station)
     acc = st["accuracy"]
-    # Load accuracy from disk if not in memory (e.g. after server restart)
-    if not acc:
-        acc = load_json_file(f"{DATA_DIR}/accuracy_{station}.json", {})
-        if acc:
-            st["accuracy"] = acc
     models = active_models(station)
-
-    # Load standard corrections from disk if not in memory
-    sc = st.get("standard_corrections") or {}
-    if not sc:
-        sc = load_json_file(f"{DATA_DIR}/std_corr_{station}.json", {})
-        st["standard_corrections"] = sc
-
     rows = []
     window_start, window_end = get_low_window()
     for i, model in enumerate(models):
@@ -450,41 +411,13 @@ def api_state():
         run_corr = (a.get("runs") or {}).get(current_run, {}).get("correction")
         overall_corr = a.get("correction")
         corr = run_corr if (run_corr not in (None, "")) else overall_corr
-
-        # Determine primary correction source
-        if run_corr not in (None, ""):
-            corr_source = "run"
-        elif overall_corr not in (None, ""):
-            corr_source = "overall"
-        else:
-            corr_source = None
-
-        # Standard backup: only fires when there is NO run-specific correction
-        sc_model = sc.get(model, {})
-        std_run_corr = sc_model.get(current_run)
-        std_overall_corr = sc_model.get("overall")
-        std_corr = std_run_corr if std_run_corr not in (None, "") else (std_overall_corr if std_overall_corr not in (None, "") else None)
-        std_corr_source = ("std_run" if std_run_corr not in (None, "") else ("std_overall" if std_overall_corr not in (None, "") else None))
-        try: std_mae = float(sc_model["std_mae"]) if sc_model.get("std_mae") not in (None, "") else None
-        except: std_mae = None
-
-        # Apply standard as fallback only when no run-specific correction exists
-        std_used = False
-        if run_corr in (None, "") and std_corr not in (None, ""):
-            corr = std_corr
-            corr_source = std_corr_source
-            std_used = True
-
-        # Always compute std_adj independently (for the side-by-side card)
-        try: std_adj = round(float(raw) + float(std_corr), 1) if raw is not None and std_corr not in (None, "") else None
-        except: std_adj = None
-
         try: adj = round(float(raw) + float(corr), 1) if raw is not None and corr not in (None, "") else None
         except: adj = None
         obs_temp = (st["obs"] or {}).get("temperature_display")
         current_fcst = fcst.get("current_fcst")
         try: pace = round(float(obs_temp) - float(current_fcst), 1) if obs_temp and current_fcst else None
         except: pace = None
+        # Fall back to run-specific MAE for display if overall is null
         display_mae = a.get("mae")
         if display_mae is None:
             run_mae = (a.get("runs") or {}).get(current_run, {}).get("mae")
@@ -495,12 +428,7 @@ def api_state():
             "rank": i+1, "model": model,
             "run": fcst.get("run", "—"),
             "raw_low": raw, "correction": corr,
-            "corr_source": corr_source,
-            "std_used": std_used,
-            "std_corr": std_corr,
-            "std_corr_source": std_corr_source,
-            "std_adj": std_adj,
-            "std_mae": std_mae,
+            "corr_source": "run" if (run_corr not in (None, "")) else "overall",
             "adj_low": adj, "pace": pace,
             "low_time": fcst.get("low_time"),
             "mae": display_mae, "rmse": a.get("rmse"),
@@ -555,45 +483,14 @@ def api_history():
         station = "KPHL"
     return jsonify(load_json_file(f"{DATA_DIR}/history_{station}.json", {}))
 
-@app.route("/api/accuracy", methods=["GET", "POST"])
+@app.route("/api/accuracy", methods=["POST"])
 def save_accuracy():
     station = request.args.get("station", "KPHL").upper()
     if station not in STATIONS:
         station = "KPHL"
-    if request.method == "GET":
-        acc = get_state(station).get("accuracy") or {}
-        if not acc:
-            acc = load_json_file(f"{DATA_DIR}/accuracy_{station}.json", {})
-            if acc:
-                get_state(station)["accuracy"] = acc
-        return jsonify(acc)
-    data = request.json or {}
-    get_state(station)["accuracy"] = data
-    save_json_file(f"{DATA_DIR}/accuracy_{station}.json", data)
+    get_state(station)["accuracy"] = request.json or {}
     add_log("Accuracy data updated", "ok", station)
     return jsonify({"ok": True})
-
-@app.route("/api/standard_corrections", methods=["GET", "POST"])
-def standard_corrections():
-    station = request.args.get("station", "KPHL").upper()
-    if station not in STATIONS:
-        station = "KPHL"
-    if request.method == "POST":
-        data = request.json or {}
-        today = local_now().strftime("%Y-%m-%d")
-        data["_saved_date"] = today
-        get_state(station)["standard_corrections"] = data
-        path = f"{DATA_DIR}/std_corr_{station}.json"
-        save_json_file(path, data)
-        add_log(f"Standard corrections updated ({len([k for k in data if not k.startswith('_')])} models)", "ok", station)
-        return jsonify({"ok": True, "saved_date": today})
-    else:
-        # Return in-memory; fall back to disk
-        sc = get_state(station).get("standard_corrections") or {}
-        if not sc:
-            sc = load_json_file(f"{DATA_DIR}/std_corr_{station}.json", {})
-            get_state(station)["standard_corrections"] = sc
-        return jsonify(sc)
 
 @app.route("/api/consensus_snapshots")
 def api_consensus_snapshots():
@@ -784,7 +681,6 @@ input[type=number]:focus{border-color:var(--ice)}
   <button onclick="showTab('log',this)">&#128319; Log</button>
   <button onclick="showTab('history',this)">&#128196; History</button>
   <button onclick="showTab('snapshots',this);loadSnapshots();">&#128248; Snapshots</button>
-  <button onclick="showTab('stdcorr',this);loadStdCorr();">&#128203; Std Corrections</button>
   <button onclick="showTab('verification',this);loadVerification();">&#9989; Verification</button>
 </nav>
 
@@ -810,21 +706,6 @@ input[type=number]:focus{border-color:var(--ice)}
       <table>
         <thead><tr><th>#</th><th>Model</th><th>Run</th><th>Fcst Low</th><th>Correction</th><th>Adj Low</th><th>Obs Pace</th><th>Low Time</th><th>MAE</th><th>RMSE</th></tr></thead>
         <tbody id="main-tbody"></tbody>
-      </table>
-    </div>
-  </div>
-
-  <div class="card" id="std-adj-card" style="display:none">
-    <div class="ctitle">Standard Backup Adjustments
-      <span style="font-size:10px;color:var(--dim);margin-left:10px;letter-spacing:0;text-transform:none">
-        <span style="color:#c084fc;font-weight:600">S</span> = standard used as fallback &nbsp;|&nbsp;
-        <span style="color:#4ade80;font-weight:600">+</span> = run-specific exists, standard shown for reference
-      </span>
-    </div>
-    <div style="overflow-x:auto">
-      <table>
-        <thead><tr><th>Model</th><th>Run</th><th>Fcst Low</th><th>Run Adj Low</th><th>Std Correction</th><th>Std MAE</th><th>Std Adj Low</th><th>Note</th></tr></thead>
-        <tbody id="std-adj-tbody"></tbody>
       </table>
     </div>
   </div>
@@ -961,60 +842,6 @@ input[type=number]:focus{border-color:var(--ice)}
 </div>
 
 
-<!-- STANDARD CORRECTIONS TAB -->
-<div class="tab" id="tab-stdcorr">
-  <div class="card" style="border-color:#1e3a5f">
-    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:10px">
-      <div>
-        <div class="ctitle" style="margin-bottom:2px">Daily Standard Backup Corrections</div>
-        <div style="font-size:11px;color:var(--dim)">For: <span id="stdcorr-today" style="color:var(--ice);font-weight:600">--</span></div>
-      </div>
-      <div style="display:flex;align-items:center;gap:10px">
-        <span id="stdcorr-stale-badge" style="display:none;background:#f87171aa;color:#fff;border-radius:4px;padding:3px 10px;font-size:10px;font-weight:700;letter-spacing:1px">⚠ NOT UPDATED TODAY</span>
-        <span id="stdcorr-ok-badge" style="display:none;background:#4ade8033;color:var(--green);border-radius:4px;padding:3px 10px;font-size:10px;font-weight:700;letter-spacing:1px">✓ TODAY'S ENTRY SAVED</span>
-        <span style="font-size:10px;color:var(--dimmer)" id="stdcorr-saved-at"></span>
-      </div>
-    </div>
-    <p style="color:var(--dim);font-size:12px;line-height:1.7;margin-bottom:14px">
-      Used automatically when a model run has <em>no</em> run-specific correction. Update each morning alongside your accuracy data.
-    </p>
-    <div style="display:flex;gap:10px;align-items:center;margin-bottom:14px;flex-wrap:wrap">
-      <label style="font-size:10px;color:var(--dim);letter-spacing:1px">FAST IMPORT (JSON)</label>
-      <textarea id="stdcorr-paste" placeholder='{"UKMO":{"12Z":-0.4,"overall":-0.3},"GFS":{"00Z":0.2}}' style="width:340px;height:52px;background:#060a0e;border:1px solid #1e3a5f;border-radius:4px;color:var(--text);padding:8px;font-family:inherit;font-size:11px;resize:vertical;outline:none"></textarea>
-      <button class="btn" onclick="loadStdCorrJSON()">Load JSON</button>
-      <span style="font-size:10px;color:var(--dim)" id="stdcorr-json-status"></span>
-    </div>
-  </div>
-
-  <div class="card">
-    <div class="ctitle">Active Models &mdash; Standard Backup Corrections
-      <span style="font-size:10px;color:var(--dim);margin-left:10px;letter-spacing:0;text-transform:none">R = run-specific &bull; O = overall fallback &bull; matches your loaded accuracy model set</span>
-    </div>
-    <div style="font-size:11px;color:var(--yellow);margin-bottom:10px" id="stdcorr-no-models" style="display:none"></div>
-    <div style="overflow-x:auto">
-      <table>
-        <thead><tr><th>Model</th><th>Std MAE</th><th>Overall Backup</th><th>00Z</th><th>03Z</th><th>06Z</th><th>09Z</th><th>12Z</th><th>15Z</th><th>18Z</th><th>21Z</th></tr></thead>
-        <tbody id="stdcorr-tbody"></tbody>
-      </table>
-    </div>
-    <div style="margin-top:14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-      <button class="btn btn-green" onclick="saveStdCorr()">Save for Today</button>
-      <button class="btn btn-red" onclick="clearStdCorr()">Clear All</button>
-      <span style="font-size:10px;color:var(--dim)" id="stdcorr-save-status"></span>
-    </div>
-  </div>
-
-  <div class="card">
-    <div class="ctitle">Currently Active Standard Corrections</div>
-    <div style="overflow-x:auto">
-      <table>
-        <thead><tr><th>Model</th><th>Std MAE</th><th>Overall</th><th>Run-Specific Entries</th></tr></thead>
-        <tbody id="stdcorr-preview-tbody"><tr><td colspan="4" style="color:var(--dim)">None loaded.</td></tr></tbody>
-      </table>
-    </div>
-  </div>
-</div>
-
 <!-- VERIFICATION TAB -->
 <div class="tab" id="tab-verification">
   <div class="card" style="border-color:#1e3a5f">
@@ -1073,7 +900,6 @@ function clearDisplay(){
   var tbody = document.getElementById("main-tbody"); if(tbody) tbody.innerHTML="";
   var pbars = document.getElementById("pbars"); if(pbars) pbars.innerHTML="";
   var pace = document.getElementById("pace-card"); if(pace) pace.style.display="none";
-  var stdAdj = document.getElementById("std-adj-card"); if(stdAdj) stdAdj.style.display="none";
   document.getElementById("stxt").textContent="Switching...";
 }
 
@@ -1093,21 +919,7 @@ function switchStation(s){
   });
   var names = {"KPHL":"Philadelphia International Airport","KATL":"Atlanta Hartsfield-Jackson Airport","KOKC":"Oklahoma City Will Rogers World Airport"};
   document.getElementById("h-sub").textContent = names[s] || s;
-  // If localStorage is empty for this station, pull accuracy from server
-  if(!MODELS.length){
-    fetch("/api/accuracy?station="+s)
-      .then(function(r){ return r.json(); })
-      .then(function(data){
-        if(data && Object.keys(data).length){
-          accData = data;
-          MODELS = Object.keys(data).filter(function(m){ return m !== "NWS"; });
-          localStorage.setItem("acc_lows_"+s, JSON.stringify(data));
-        }
-        buildForms(); renderPreview(); poll();
-      }).catch(function(){ buildForms(); renderPreview(); poll(); });
-  } else {
-    buildForms(); renderPreview(); poll();
-  }
+  buildForms(); renderPreview(); poll();
 }
 
 var MANUAL_RUNS = ["00Z","03Z","06Z","09Z","12Z","15Z","18Z","21Z"];
@@ -1281,7 +1093,7 @@ function render(data){
       +'<td style="color:#e8f0f8;font-weight:600">'+r.model+'</td>'
       +'<td style="color:var(--dim);font-size:11px">'+(r.run||"--")+'</td>'
       +'<td style="color:var(--ice)">'+(r.raw_low!=null?r.raw_low+"F":"--")+'</td>'
-      +'<td style="color:'+corrColor(r.correction)+'">'+(r.correction!=null&&r.correction!==""?fmtC(r.correction)+(r.corr_source==="run"?' <span style="font-size:9px;color:#38bdf8">R</span>':'')+(r.corr_source==="std_run"?' <span style="font-size:9px;color:#c084fc" title="Standard backup (run-specific)">S</span>':'')+(r.corr_source==="std_overall"?' <span style="font-size:9px;color:#a78bfa" title="Standard backup (overall)">S</span>':''):"--")+'</td>'
+      +'<td style="color:'+corrColor(r.correction)+'">'+(r.correction!=null&&r.correction!==""?fmtC(r.correction)+(r.corr_source==="run"?' <span style="font-size:9px;color:#38bdf8">R</span>':''):"--")+'</td>'
       +'<td style="color:var(--blue);font-weight:600">'+(r.adj_low!=null?r.adj_low+"F":"--")+'</td>'
       +'<td style="color:'+(r.pace!=null?paceColor(r.pace):"#1e2e42")+'">'+(r.pace!=null?(r.pace>=0?"+":"")+r.pace+"F":"--")+'</td>'
       +'<td style="color:var(--dim);font-size:11px">'+(r.low_time||"--")+'</td>'
@@ -1299,43 +1111,6 @@ function render(data){
         +'<div style="width:160px"><div class="pbar" style="width:'+w+'px;background:'+col+'33;border:1px solid '+col+'"></div></div>'
         +'<span style="font-size:11px;color:'+paceColor(r.pace)+';font-weight:600">'+(p>=0?"+":"")+r.pace+'F</span></div>';
     }).join("");
-  }
-
-  // Standard Adj card: show rows that have a standard correction defined
-  var stdRows = rows.filter(function(r){ return r.std_corr != null; });
-  var stdCard = document.getElementById("std-adj-card");
-  if(stdRows.length){
-    stdCard.style.display = "block";
-    document.getElementById("std-adj-tbody").innerHTML = stdRows.map(function(r,i){
-      var bg = i%2?"background:#0a1018":"";
-      var hasRunCorr = r.corr_source === "run" || r.corr_source === "overall";
-      // If std was used as fallback: show S badge; if run corr exists too: show reference note
-      var runAdjCell, noteCell;
-      if(r.std_used){
-        // No run-specific correction — standard is what's used
-        runAdjCell = '<td style="color:#2a3a50">--</td>';
-        noteCell = '<td><span style="color:#c084fc;font-size:10px;font-weight:600">S FALLBACK</span></td>';
-      } else {
-        // Run-specific correction exists — standard shown as reference only
-        runAdjCell = '<td style="color:var(--blue);font-weight:600">'+(r.adj_low!=null?r.adj_low+"F":"--")+'</td>';
-        noteCell = '<td style="color:var(--green);font-size:10px">ref only</td>';
-      }
-      var stdCorrSrc = r.std_corr_source==="std_run"
-        ? ' <span style="font-size:9px;color:#c084fc">R</span>'
-        : ' <span style="font-size:9px;color:#a78bfa">O</span>';
-      return '<tr style="'+bg+'">'
-        +'<td style="color:#e8f0f8;font-weight:600">'+r.model+'</td>'
-        +'<td style="color:var(--dim);font-size:11px">'+(r.run||"--")+'</td>'
-        +'<td style="color:var(--ice)">'+(r.raw_low!=null?r.raw_low+"F":"--")+'</td>'
-        +runAdjCell
-        +'<td style="color:'+corrColor(r.std_corr)+'">'+fmtC(r.std_corr)+stdCorrSrc+'</td>'
-        +'<td style="color:#f59e0b">'+(r.std_mae!=null?r.std_mae:"--")+'</td>'
-        +'<td style="color:'+(r.std_used?"var(--purple)":"var(--dim)")+';font-weight:'+(r.std_used?"700":"400")+'">'+(r.std_adj!=null?r.std_adj+"F":"--")+'</td>'
-        +noteCell
-        +'</tr>';
-    }).join("");
-  } else {
-    stdCard.style.display = "none";
   }
 
   document.getElementById("runview-tbody").innerHTML = rows.map(function(r,i){
@@ -1420,6 +1195,9 @@ function render(data){
 }
 
 function poll(){
+  if(Object.keys(accData).length){
+    fetch("/api/accuracy?station="+STATION,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(accData)});
+  }
   fetch("/api/state?station="+STATION).then(function(r){ return r.json(); }).then(render).catch(function(e){ console.error(e); });
 }
 
@@ -1442,23 +1220,7 @@ function startCountdown(){
   },1000);
 }
 
-// On startup, if localStorage is empty for this station fetch from server
-if(!MODELS.length){
-  fetch("/api/accuracy?station="+STATION)
-    .then(function(r){ return r.json(); })
-    .then(function(data){
-      if(data && Object.keys(data).length){
-        accData = data;
-        MODELS = Object.keys(data).filter(function(m){ return m !== "NWS"; });
-        localStorage.setItem("acc_lows_"+STATION, JSON.stringify(data));
-      }
-      buildForms(); renderPreview(); poll(); startCountdown(); setInterval(poll,1200000);
-    }).catch(function(){
-      buildForms(); renderPreview(); poll(); startCountdown(); setInterval(poll,1200000);
-    });
-} else {
-  buildForms(); renderPreview(); poll(); startCountdown(); setInterval(poll,1200000);
-}
+buildForms(); renderPreview(); poll(); startCountdown(); setInterval(poll,1200000);
 
 document.addEventListener("visibilitychange", function(){
   if(document.visibilityState === "visible"){ poll(); }
@@ -1632,155 +1394,6 @@ function submitVerification(){
 document.querySelectorAll("nav button").forEach(function(btn){
   btn.addEventListener("click", function(){
     if(btn.textContent.includes("Verification")) loadVerification();
-  });
-});
-
-// ---- Standard Corrections ----
-function todayStr(){
-  var d = new Date();
-  return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0");
-}
-
-function updateStdCorrDateUI(savedDate){
-  var today = todayStr();
-  var todayEl = document.getElementById("stdcorr-today");
-  var staleEl = document.getElementById("stdcorr-stale-badge");
-  var okEl = document.getElementById("stdcorr-ok-badge");
-  var savedAtEl = document.getElementById("stdcorr-saved-at");
-  if(todayEl) todayEl.textContent = today;
-  if(savedDate){
-    var isToday = savedDate === today;
-    if(staleEl) staleEl.style.display = isToday ? "none" : "inline";
-    if(okEl) okEl.style.display = isToday ? "inline" : "none";
-    if(savedAtEl) savedAtEl.textContent = "Last saved: " + savedDate;
-  } else {
-    if(staleEl) staleEl.style.display = "inline";
-    if(okEl) okEl.style.display = "none";
-    if(savedAtEl) savedAtEl.textContent = "Never saved";
-  }
-}
-
-function buildStdCorrTable(){
-  var mods = MODELS.length ? MODELS : [];
-  var noModsEl = document.getElementById("stdcorr-no-models");
-  if(!mods.length){
-    if(noModsEl) noModsEl.textContent = "⚠ No accuracy data loaded — load your models in Morning Entry first.";
-    document.getElementById("stdcorr-tbody").innerHTML = '<tr><td colspan="11" style="color:var(--dim)">No models loaded.</td></tr>';
-    return;
-  }
-  if(noModsEl) noModsEl.textContent = "";
-  var runs = ["00Z","03Z","06Z","09Z","12Z","15Z","18Z","21Z"];
-  document.getElementById("stdcorr-tbody").innerHTML = mods.map(function(m,i){
-    var d = stdCorrData[m]||{};
-    var bg = i%2?"background:#0a1018":"";
-    var maeCell = '<td><input type="number" step="0.01" min="0" placeholder="—" id="sc-mae-'+m+'" value="'+(d.std_mae!=null?d.std_mae:"")+'" style="width:54px;color:#f59e0b"></td>';
-    var overallCell = '<td><input type="number" step="0.1" placeholder="—" id="sc-ov-'+m+'" value="'+(d.overall!=null?d.overall:"")+'" style="width:58px"></td>';
-    var runCells = runs.map(function(r){
-      return '<td><input type="number" step="0.1" placeholder="—" id="sc-'+m+'-'+r+'" value="'+(d[r]!=null?d[r]:"")+'" style="width:52px;font-size:11px"></td>';
-    }).join("");
-    return '<tr style="'+bg+'"><td style="color:#e8f0f8;font-weight:600">'+m+'</td>'+maeCell+overallCell+runCells+'</tr>';
-  }).join("");
-}
-
-function collectStdCorrData(){
-  var runs = ["00Z","03Z","06Z","09Z","12Z","15Z","18Z","21Z"];
-  var out = {};
-  (MODELS.length ? MODELS : []).forEach(function(m){
-    var obj = {};
-    var mae = document.getElementById("sc-mae-"+m);
-    if(mae && mae.value!=="") obj.std_mae = parseFloat(mae.value);
-    var ov = document.getElementById("sc-ov-"+m);
-    if(ov && ov.value!=="") obj.overall = parseFloat(ov.value);
-    runs.forEach(function(r){
-      var el = document.getElementById("sc-"+m+"-"+r);
-      if(el && el.value!=="") obj[r] = parseFloat(el.value);
-    });
-    if(Object.keys(obj).length) out[m] = obj;
-  });
-  return out;
-}
-
-function renderStdCorrPreview(data){
-  var mods = Object.keys(data).filter(function(k){ return !k.startsWith("_"); });
-  if(!mods.length){
-    document.getElementById("stdcorr-preview-tbody").innerHTML = '<tr><td colspan="4" style="color:var(--dim)">None loaded.</td></tr>';
-    return;
-  }
-  document.getElementById("stdcorr-preview-tbody").innerHTML = mods.map(function(m,i){
-    var d = data[m]||{};
-    var bg = i%2?"background:#0a1018":"";
-    var mae = d.std_mae!=null ? '<span style="color:#f59e0b;font-weight:600">'+d.std_mae+'</span>' : '<span style="color:#2a3a50">—</span>';
-    var ov = d.overall!=null ? '<span style="color:'+corrColor(d.overall)+';font-weight:600">'+fmtC(d.overall)+'</span>' : '<span style="color:#2a3a50">—</span>';
-    var runs = Object.entries(d).filter(function(e){ return e[0]!=="overall" && e[0]!=="std_mae"; })
-      .map(function(e){ return '<span style="color:#8aabcc">'+e[0]+':</span><span style="color:'+corrColor(e[1])+'"> '+fmtC(e[1])+'</span>'; }).join("  ");
-    return '<tr style="'+bg+'"><td style="color:#e8f0f8;font-weight:600">'+m+'</td><td>'+mae+'</td><td>'+ov+'</td><td style="font-size:11px">'+(runs||'<span style="color:#2a3a50">—</span>')+'</td></tr>';
-  }).join("");
-}
-
-function loadStdCorr(){
-  var todayEl = document.getElementById("stdcorr-today");
-  if(todayEl) todayEl.textContent = todayStr();
-  fetch("/api/standard_corrections?station="+STATION)
-    .then(function(r){ return r.json(); })
-    .then(function(data){
-      stdCorrData = data||{};
-      updateStdCorrDateUI(stdCorrData._saved_date || null);
-      buildStdCorrTable();
-      renderStdCorrPreview(stdCorrData);
-    }).catch(function(e){ console.error("stdcorr load error",e); });
-}
-
-function saveStdCorr(){
-  stdCorrData = collectStdCorrData();
-  var status = document.getElementById("stdcorr-save-status");
-  fetch("/api/standard_corrections?station="+STATION,{
-    method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(stdCorrData)
-  }).then(function(r){ return r.json(); })
-  .then(function(d){
-    status.style.color="var(--green)";
-    status.textContent = "Saved "+Object.keys(stdCorrData).length+" models at "+new Date().toLocaleTimeString();
-    updateStdCorrDateUI(d.saved_date || todayStr());
-    renderStdCorrPreview(stdCorrData);
-  }).catch(function(e){ status.style.color="var(--red)"; status.textContent="Error: "+e.message; });
-}
-
-function clearStdCorr(){
-  if(!confirm("Clear all standard backup corrections?")) return;
-  stdCorrData = {};
-  fetch("/api/standard_corrections?station="+STATION,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({})})
-    .then(function(r){ return r.json(); })
-    .then(function(d){ updateStdCorrDateUI(null); });
-  buildStdCorrTable();
-  renderStdCorrPreview({});
-  document.getElementById("stdcorr-save-status").textContent="Cleared";
-}
-
-function loadStdCorrJSON(){
-  var raw = document.getElementById("stdcorr-paste").value.trim();
-  var status = document.getElementById("stdcorr-json-status");
-  if(!raw){ status.style.color="var(--red)"; status.textContent="Nothing to paste."; return; }
-  try {
-    var parsed = JSON.parse(raw);
-    stdCorrData = parsed;
-    buildStdCorrTable();
-    fetch("/api/standard_corrections?station="+STATION,{
-      method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(parsed)
-    }).then(function(r){ return r.json(); })
-    .then(function(d){
-      status.style.color="var(--green)";
-      status.textContent = "Loaded "+Object.keys(parsed).length+" models.";
-      document.getElementById("stdcorr-paste").value="";
-      updateStdCorrDateUI(d.saved_date || todayStr());
-      renderStdCorrPreview(stdCorrData);
-    });
-  } catch(e){
-    status.style.color="var(--red)"; status.textContent="Invalid JSON: "+e.message;
-  }
-}
-
-document.querySelectorAll("nav button").forEach(function(btn){
-  btn.addEventListener("click", function(){
-    if(btn.textContent.includes("Std Corrections")) loadStdCorr();
   });
 });
 </script>
