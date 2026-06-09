@@ -329,7 +329,7 @@ def save_consensus_snapshot(station="KPHL"):
         try:
             current_fcst = fcst.get("current_fcst")
             pace = round(float(obs_temp) - float(current_fcst), 2) if obs_temp and current_fcst else None
-            mae = float(a.get("mae") or 0)
+            mae = float(run_data.get("mae") or 0)
             if mae > 0 and pace is not None:
                 w = 1/mae; pw_sum += float(pace)*w; pw_total += w
         except: pass
