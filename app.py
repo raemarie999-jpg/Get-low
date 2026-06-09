@@ -152,7 +152,7 @@ def fetch_all(station="KPHL"):
 
     # Wethr low
     try:
-        wl = wethr_get(f"observations.php?station_code={station}&mode=wethr_high&logic=nws")
+        wl = wethr_get(f"observations.php?station_code={station}&mode=wethr_low&logic=nws")
         st["wethr_low"] = wl
         add_log(f"Wethr Low: {wl.get('wethr_low')}F", "ok", station)
     except Exception as e:
