@@ -139,6 +139,7 @@ def fetch_all(station="KPHL"):
         add_log("No API key set", "err", station)
         return
     add_log("Fetching data...", "info", station)
+    load_accuracy(station)
     errors = []
 
     # Observation
@@ -490,7 +491,7 @@ def save_accuracy():
         station = "KPHL"
     get_state(station)["accuracy"] = request.json or {}
     add_log("Accuracy data updated", "ok", station)
-    save_json_file(f"{DATA_DIR}/accuracy_{station}.json", data)
+    save_json_file(f"{DATA_DIR}/accuracy_{station}.json", request.json or {})
     return jsonify({"ok": True})
 
 @app.route("/api/consensus_snapshots")
