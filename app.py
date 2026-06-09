@@ -1195,9 +1195,6 @@ function render(data){
 }
 
 function poll(){
-  if(Object.keys(accData).length){
-    fetch("/api/accuracy?station="+STATION,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(accData)});
-  }
   fetch("/api/state?station="+STATION).then(function(r){ return r.json(); }).then(render).catch(function(e){ console.error(e); });
 }
 
