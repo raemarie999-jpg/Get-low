@@ -408,9 +408,8 @@ def api_state():
         fcst = st["forecasts"].get(model, {})
         raw = fcst.get("low")
         current_run = fcst.get("run", "")
-        run_corr = (a.get("runs") or {}).get(current_run, {}).get("correction")
-        overall_corr = a.get("correction")
-        corr = run_corr if (run_corr not in (None, "")) else overall_corr
+        run_data = a.get(current_run) or (a.get("runs") or {}).get(current_run) or {}
+        corr = run_data.get("correction")
         try: adj = round(float(raw) + float(corr), 1) if raw is not None and corr not in (None, "") else None
         except: adj = None
         obs_temp = (st["obs"] or {}).get("temperature_display")
@@ -418,12 +417,7 @@ def api_state():
         try: pace = round(float(obs_temp) - float(current_fcst), 1) if obs_temp and current_fcst else None
         except: pace = None
         # Fall back to run-specific MAE for display if overall is null
-        display_mae = a.get("mae")
-        if display_mae is None:
-            run_mae = (a.get("runs") or {}).get(current_run, {}).get("mae")
-            if run_mae not in (None, ""):
-                try: display_mae = float(run_mae)
-                except: pass
+        display_mae = run_data.get("mae")
         rows.append({
             "rank": i+1, "model": model,
             "run": fcst.get("run", "—"),
