@@ -1407,7 +1407,7 @@ _started = False
 _start_lock = threading.Lock()
 
 def load_accuracy(station):
-    data = load_json_file(f"{DATA_DIR}/accuracy_{station}.json, {})
+    data = load_json_file(f"{DATA_DIR}/accuracy_{station}.json", {})
     if data:
         get_state(station)["accuracy"] = data
 
