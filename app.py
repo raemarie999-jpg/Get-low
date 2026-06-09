@@ -490,6 +490,7 @@ def save_accuracy():
         station = "KPHL"
     get_state(station)["accuracy"] = request.json or {}
     add_log("Accuracy data updated", "ok", station)
+    save_json_file(f"{DATA_DIR}/accuracy_{station}.json", data)
     return jsonify({"ok": True})
 
 @app.route("/api/consensus_snapshots")
