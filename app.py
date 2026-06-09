@@ -318,11 +318,10 @@ def save_consensus_snapshot(station="KPHL"):
         fcst = forecasts.get(model, {})
         raw = fcst.get("low")
         current_run = fcst.get("run", "")
-        run_corr = (a.get("runs") or {}).get(current_run, {}).get("correction")
-        overall_corr = a.get("correction")
-        corr = run_corr if run_corr not in (None, "") else overall_corr
+        run_data = a.get(current_run) or (a.get("runs") or {}).get(current_run) or {}
+        corr = run_data.get("correction")
         try:
-            mae = float(a.get("mae") or 0)
+            mae = float(run_data.get("mae") or 0)
             adj = round(float(raw) + float(corr), 1) if raw is not None and corr not in (None, "") else None
             if mae > 0 and adj is not None:
                 w = 1/mae; w_sum += adj*w; w_total += w
