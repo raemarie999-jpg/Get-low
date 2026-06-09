@@ -139,7 +139,6 @@ def fetch_all(station="KPHL"):
         add_log("No API key set", "err", station)
         return
     add_log("Fetching data...", "info", station)
-    load_accuracy(station)
     errors = []
 
     # Observation
