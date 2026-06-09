@@ -1212,10 +1212,13 @@ function startCountdown(){
 }
 
 buildForms(); renderPreview();
+startCountdown(); setInterval(poll,1200000);
 if(Object.keys(accData).length){
-  fetch("/api/accuracy?station="+STATION,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(accData)});
+  fetch("/api/accuracy?station="+STATION,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(accData)})
+    .then(function(){ poll(); });
+} else {
+  poll();
 }
-poll(); startCountdown(); setInterval(poll,1200000);
 
 document.addEventListener("visibilitychange", function(){
   if(document.visibilityState === "visible"){ poll(); }
