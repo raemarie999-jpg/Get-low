@@ -1217,7 +1217,11 @@ function startCountdown(){
   },1000);
 }
 
-buildForms(); renderPreview(); poll(); startCountdown(); setInterval(poll,1200000);
+buildForms(); renderPreview();
+if(Object.keys(accData).length){
+  fetch("/api/accuracy?station="+STATION,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(accData)});
+}
+poll(); startCountdown(); setInterval(poll,1200000);
 
 document.addEventListener("visibilitychange", function(){
   if(document.visibilityState === "visible"){ poll(); }
