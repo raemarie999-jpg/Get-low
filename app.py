@@ -421,7 +421,7 @@ def api_state():
             "rank": i+1, "model": model,
             "run": fcst.get("run", "—"),
             "raw_low": raw, "correction": corr,
-            "corr_source": "run" if (run_corr not in (None, "")) else "overall",
+            "corr_source": "run",
             "adj_low": adj, "pace": pace,
             "low_time": fcst.get("low_time"),
             "mae": display_mae, "rmse": a.get("rmse"),
