@@ -97,24 +97,15 @@ def parse_vt(x):
     except: return None
 
 def local_now():
-    # Use UTC-5 as base local time (same as highs app)
     return datetime.utcnow() - timedelta(hours=5)
 
 def get_low_window():
-    """
-    Returns (window_start, window_end) for the current target low period.
-    From noon onward: target is NEXT 1AM-1AM window.
-    Before noon: target is CURRENT 1AM-1AM window (1AM today -> 1AM tomorrow).
-    Window is in UTC.
-    """
     now_local = local_now()
     if now_local.hour > 9 or (now_local.hour == 9 and now_local.minute >= 30):
-        # 9:30AM or later: target NEXT 1AM-1AM window (tomorrow 1AM -> day after 1AM)
         tomorrow = now_local.replace(hour=1, minute=0, second=0, microsecond=0) + timedelta(days=1)
         window_start_utc = tomorrow + timedelta(hours=5)
         window_end_utc = window_start_utc + timedelta(hours=24)
     else:
-        # Before 9:30AM: target CURRENT 1AM-1AM window (today 1AM -> tomorrow 1AM)
         today_1am = now_local.replace(hour=1, minute=0, second=0, microsecond=0)
         window_start_utc = today_1am + timedelta(hours=5)
         window_end_utc = window_start_utc + timedelta(hours=24)
@@ -132,6 +123,24 @@ def fmt_run(run_raw):
         return run_raw or "—"
     except:
         return "—"
+
+def get_run_data(acc_model, run_key):
+    """
+    Look up run-specific accuracy data for a model.
+    Priority: exact run match -> 'default' fallback -> empty dict.
+    Returns (run_data_dict, source_label) where source_label is 'run', 'default', or 'overall'.
+    """
+    runs = acc_model.get("runs") or {}
+    # 1. Exact run match
+    rd = runs.get(run_key, {})
+    if rd and (rd.get("mae") or rd.get("correction") not in (None, "")):
+        return rd, "run"
+    # 2. Default fallback run
+    default_rd = runs.get("default", {})
+    if default_rd and (default_rd.get("mae") or default_rd.get("correction") not in (None, "")):
+        return default_rd, "default"
+    # 3. Nothing run-specific found
+    return {}, "overall"
 
 def fetch_all(station="KPHL"):
     st = get_state(station)
@@ -177,11 +186,8 @@ def fetch_all(station="KPHL"):
                 if not window:
                     add_log(f"{model}: no entries in low window", "warn", station)
                     continue
-                # Forecast low = min temp in window
                 min_entry = min(window, key=lambda x: get_temp(x) or 999)
                 raw_temp = get_temp(min_entry)
-                # Current forecast = model's forecast for closest hour to now within window
-                # If we're before the window, use the first entry
                 in_window = [x for x in window if parse_vt(x) is not None and parse_vt(x) <= datetime.utcnow()]
                 if in_window:
                     closest = min(in_window, key=lambda x: abs((parse_vt(x) - utc_now).total_seconds()) if parse_vt(x) else 99999)
@@ -190,7 +196,6 @@ def fetch_all(station="KPHL"):
                 current_temp = get_temp(closest)
                 run_raw = meta.get("run_time") or min_entry.get("run_time") or min_entry.get("run") or ""
                 run_fmt = fmt_run(run_raw)
-                # Local time of forecast low
                 vt = parse_vt(min_entry)
                 low_time = None
                 if vt:
@@ -318,10 +323,17 @@ def save_consensus_snapshot(station="KPHL"):
         fcst = forecasts.get(model, {})
         raw = fcst.get("low")
         current_run = fcst.get("run", "")
-        run_data = a.get(current_run) or (a.get("runs") or {}).get(current_run) or {}
-        corr = run_data.get("correction")
+        # Use the helper with default fallback
+        run_data, _ = get_run_data(a, current_run)
+        corr = run_data.get("correction") if run_data else None
+        # Fall back to overall correction if run_data has none
+        if corr in (None, ""):
+            corr = a.get("correction")
         try:
-            mae = float(run_data.get("mae") or 0)
+            mae_val = run_data.get("mae") if run_data else None
+            if not mae_val:
+                mae_val = a.get("mae")
+            mae = float(mae_val or 0)
             adj = round(float(raw) + float(corr), 1) if raw is not None and corr not in (None, "") else None
             if mae > 0 and adj is not None:
                 w = 1/mae; w_sum += adj*w; w_total += w
@@ -329,7 +341,10 @@ def save_consensus_snapshot(station="KPHL"):
         try:
             current_fcst = fcst.get("current_fcst")
             pace = round(float(obs_temp) - float(current_fcst), 2) if obs_temp and current_fcst else None
-            mae = float(run_data.get("mae") or 0)
+            mae_val = run_data.get("mae") if run_data else None
+            if not mae_val:
+                mae_val = a.get("mae")
+            mae = float(mae_val or 0)
             if mae > 0 and pace is not None:
                 w = 1/mae; pw_sum += float(pace)*w; pw_total += w
         except: pass
@@ -407,36 +422,44 @@ def api_state():
         fcst = st["forecasts"].get(model, {})
         raw = fcst.get("low")
         current_run = fcst.get("run", "")
-        run_data = a.get(current_run) or (a.get("runs") or {}).get(current_run) or {}
-        corr = run_data.get("correction")
+
+        # Use helper: exact run -> default fallback -> overall
+        run_data, corr_source = get_run_data(a, current_run)
+        corr = run_data.get("correction") if run_data else None
+        display_mae = run_data.get("mae") if run_data else None
+
+        # If run_data gave nothing useful, fall back to overall
+        if corr in (None, ""):
+            corr = a.get("correction")
+            if corr not in (None, ""):
+                corr_source = "overall"
+        if not display_mae:
+            display_mae = a.get("mae")
+
         try: adj = round(float(raw) + float(corr), 1) if raw is not None and corr not in (None, "") else None
         except: adj = None
         obs_temp = (st["obs"] or {}).get("temperature_display")
         current_fcst = fcst.get("current_fcst")
         try: pace = round(float(obs_temp) - float(current_fcst), 1) if obs_temp and current_fcst else None
         except: pace = None
-        # Fall back to run-specific MAE for display if overall is null
-        display_mae = run_data.get("mae")
+
         rows.append({
             "rank": i+1, "model": model,
             "run": fcst.get("run", "—"),
             "raw_low": raw, "correction": corr,
-            "corr_source": "run",
+            "corr_source": corr_source,   # "run", "default", or "overall"
             "adj_low": adj, "pace": pace,
             "low_time": fcst.get("low_time"),
             "mae": display_mae, "rmse": a.get("rmse"),
             "runs": a.get("runs", {}),
         })
+
     def get_mae(r):
         if r.get("mae") not in (None, ""):
             try: return float(r["mae"])
             except: pass
-        run_key = r.get("run", "")
-        rd = (r.get("runs") or {}).get(run_key, {})
-        if rd.get("mae") not in (None, ""):
-            try: return float(rd["mae"])
-            except: pass
         return None
+
     w_sum, w_total = 0, 0
     for r in rows:
         try:
@@ -453,7 +476,6 @@ def api_state():
                 w = 1/mae; pw_sum += float(pace)*w; pw_total += w
         except: pass
     consensus_pace = round(pw_sum/pw_total, 2) if pw_total > 0 else None
-    # Window label for display
     ws_local = window_start - timedelta(hours=5)
     we_local = window_end - timedelta(hours=5)
     window_label = f"{ws_local.strftime('%a %-I%p')} – {we_local.strftime('%a %-I%p')}"
@@ -501,7 +523,6 @@ def manual_refresh():
         station = "KPHL"
     threading.Thread(target=fetch_all, args=(station,), daemon=True).start()
     return jsonify({"ok": True})
-
 
 @app.route("/api/verify", methods=["POST"])
 def save_verification():
@@ -570,7 +591,7 @@ HTML = """<!DOCTYPE html>
   --bg:#080c10;--bg2:#0e1520;--bg3:#0b1118;--border:#1a2535;
   --text:#c9d4e0;--dim:#4a6080;--dimmer:#2a3a50;
   --blue:#38bdf8;--green:#4ade80;--yellow:#facc15;--red:#f87171;--purple:#c084fc;
-  --ice:#a5f3fc;
+  --ice:#a5f3fc;--orange:#fb923c;
 }
 body{background:var(--bg);color:var(--text);font-family:'IBM Plex Mono',monospace;font-size:13px;min-height:100vh}
 header{background:var(--bg3);border-bottom:1px solid var(--border);padding:14px 20px;
@@ -620,6 +641,9 @@ input[type=number]:focus{border-color:var(--ice)}
 .pill-y{background:#facc1522;color:var(--yellow);border-radius:3px;padding:2px 7px;font-size:10px;font-weight:600}
 .pill-g{background:#4ade8022;color:var(--green);border-radius:3px;padding:2px 7px;font-size:10px;font-weight:600}
 .window-badge{background:#a5f3fc22;color:var(--ice);border-radius:3px;padding:2px 8px;font-size:10px;font-weight:600;letter-spacing:1px}
+/* Default run column highlight */
+.default-col{background:#fb923c0d !important}
+th.default-col{color:var(--orange) !important}
 </style>
 </head>
 <body>
@@ -749,6 +773,34 @@ input[type=number]:focus{border-color:var(--ice)}
     </div>
   </div>
 
+  <!-- DEFAULT FALLBACK ENTRY -->
+  <div class="card" style="border-color:#3a2a0a">
+    <div class="ctitle" style="color:var(--orange)">&#9888; Default / Fallback Run Values</div>
+    <p style="color:var(--dim);font-size:12px;line-height:1.7;margin-bottom:12px">
+      Set a fallback MAE &amp; Correction per model. These apply automatically whenever a model's active run
+      has <em>no</em> run-specific entry — keeping it out of consensus rather than polluting it with uncalibrated data.
+      <br><span style="color:var(--orange)">D</span> badge in the dashboard Correction column indicates the default is active.
+    </p>
+    <div style="overflow-x:auto">
+      <table>
+        <thead>
+          <tr>
+            <th>Model</th>
+            <th style="color:var(--orange)">Default MAE</th>
+            <th style="color:var(--orange)">Default Correction</th>
+            <th style="color:var(--dim);font-size:9px">Current Active</th>
+          </tr>
+        </thead>
+        <tbody id="default-tbody"></tbody>
+      </table>
+    </div>
+    <div style="display:flex;gap:10px;align-items:center;margin-top:14px;flex-wrap:wrap">
+      <button class="btn btn-green" onclick="saveDefaults()">Save Defaults</button>
+      <button class="btn btn-red" onclick="clearDefaults()">Clear Defaults</button>
+      <span style="font-size:10px;color:var(--dim)" id="default-status"></span>
+    </div>
+  </div>
+
   <details style="margin-bottom:16px">
     <summary style="cursor:pointer;color:var(--dim);font-size:11px;letter-spacing:1px;padding:10px 0;list-style:none">&#9658; Manual entry (fallback)</summary>
     <div style="margin-top:12px">
@@ -772,7 +824,7 @@ input[type=number]:focus{border-color:var(--ice)}
 
   <div class="card" id="acc-preview" style="display:none">
     <div class="ctitle">Currently Loaded</div>
-    <div style="overflow-x:auto"><table><thead><tr><th>Model</th><th>MAE</th><th>Correction</th><th>RMSE</th><th>Runs</th></tr></thead><tbody id="prev-tbody"></tbody></table></div>
+    <div style="overflow-x:auto"><table><thead><tr><th>Model</th><th>MAE</th><th>Correction</th><th>RMSE</th><th>Default MAE</th><th>Default Corr</th><th>Named Runs</th></tr></thead><tbody id="prev-tbody"></tbody></table></div>
     <div style="margin-top:10px;display:flex;gap:10px;align-items:center">
       <button class="btn btn-red" onclick="clearAccuracy()">Clear All</button>
       <span style="font-size:10px;color:var(--dim)" id="acc-loaded-time"></span>
@@ -783,8 +835,8 @@ input[type=number]:focus{border-color:var(--ice)}
 <!-- RUN ACCURACY -->
 <div class="tab" id="tab-runs">
   <div class="card">
-    <div class="ctitle">Run-Specific Accuracy</div>
-    <div style="overflow-x:auto"><table><thead><tr><th>Model</th><th>00Z</th><th>03Z</th><th>06Z</th><th>09Z</th><th>12Z</th><th>15Z</th><th>18Z</th><th>21Z</th></tr></thead><tbody id="runview-tbody"></tbody></table></div>
+    <div class="ctitle">Run-Specific Accuracy (including Default fallback)</div>
+    <div style="overflow-x:auto"><table><thead><tr><th>Model</th><th class="default-col">DEFAULT</th><th>00Z</th><th>03Z</th><th>06Z</th><th>09Z</th><th>12Z</th><th>15Z</th><th>18Z</th><th>21Z</th></tr></thead><tbody id="runview-tbody"></tbody></table></div>
     <div class="ctitle" style="margin-top:20px">Current Run per Model</div>
     <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:8px" id="run-cards"></div>
   </div>
@@ -834,7 +886,6 @@ input[type=number]:focus{border-color:var(--ice)}
     </div>
   </div>
 </div>
-
 
 <!-- VERIFICATION TAB -->
 <div class="tab" id="tab-verification">
@@ -913,7 +964,7 @@ function switchStation(s){
   });
   var names = {"KPHL":"Philadelphia International Airport","KATL":"Atlanta Hartsfield-Jackson Airport","KOKC":"Oklahoma City Will Rogers World Airport"};
   document.getElementById("h-sub").textContent = names[s] || s;
-  buildForms(); renderPreview(); poll();
+  buildForms(); buildDefaultForm(); renderPreview(); poll();
 }
 
 var MANUAL_RUNS = ["00Z","03Z","06Z","09Z","12Z","15Z","18Z","21Z"];
@@ -968,6 +1019,75 @@ function buildForms(){
   }).join("");
 }
 
+// --- DEFAULT FALLBACK FORM ---
+function buildDefaultForm(){
+  var mods = MODELS.length ? MODELS : ["HRRR","ARPEGE","NAM","UKMO","LAV-MOS","RAP","GEM-GDPS","NAM-MOS","NBM","NAM4KM"];
+  var tbody = document.getElementById("default-tbody");
+  if(!tbody) return;
+  tbody.innerHTML = mods.map(function(m,i){
+    var a = accData[m]||{};
+    var rd = (a.runs||{})["default"]||{};
+    var bg = i%2?"background:#0a1018":"";
+    // Show currently active run for context
+    var activeRun = "—";
+    // We don't have live run info here, just show what named runs exist
+    var namedRuns = Object.keys(a.runs||{}).filter(function(r){ return r!=="default"; }).join(", ")||"none";
+    return '<tr style="'+bg+'">'
+      +'<td style="color:#e8f0f8;font-weight:600">'+m+'</td>'
+      +'<td class="default-col"><input type="number" step="0.1" placeholder="e.g. 1.5" style="width:80px" id="def-mae-'+m+'" value="'+(rd.mae||"")+'"></td>'
+      +'<td class="default-col"><input type="number" step="0.1" placeholder="e.g. +0.5" style="width:80px" id="def-corr-'+m+'" value="'+(rd.correction||"")+'"></td>'
+      +'<td style="color:var(--dim);font-size:11px">'+namedRuns+'</td>'
+      +'</tr>';
+  }).join("");
+}
+
+function saveDefaults(){
+  var mods = MODELS.length ? MODELS : [];
+  var status = document.getElementById("default-status");
+  // Merge default values into existing accData runs
+  mods.forEach(function(m){
+    if(!accData[m]) accData[m] = {};
+    if(!accData[m].runs) accData[m].runs = {};
+    var maeEl = document.getElementById("def-mae-"+m);
+    var corrEl = document.getElementById("def-corr-"+m);
+    var mae = maeEl ? maeEl.value : "";
+    var corr = corrEl ? corrEl.value : "";
+    if(mae || corr){
+      accData[m].runs["default"] = { mae: mae, correction: corr };
+    } else {
+      // Clear the default if both fields are empty
+      delete accData[m].runs["default"];
+    }
+  });
+  localStorage.setItem("acc_lows_"+STATION, JSON.stringify(accData));
+  fetch("/api/accuracy?station="+STATION,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(accData)})
+    .then(function(r){ return r.json(); })
+    .then(function(){
+      status.style.color="var(--green)";
+      status.textContent = "Defaults saved at "+new Date().toLocaleTimeString();
+      renderPreview();
+    }).catch(function(e){
+      // Saved locally at least
+      localStorage.setItem("acc_lows_"+STATION, JSON.stringify(accData));
+      status.style.color="var(--yellow)";
+      status.textContent = "Saved locally (server: "+e.message+")";
+      renderPreview();
+    });
+}
+
+function clearDefaults(){
+  if(!confirm("Clear all default fallback values?")) return;
+  var mods = MODELS.length ? MODELS : [];
+  mods.forEach(function(m){
+    if(accData[m] && accData[m].runs) delete accData[m].runs["default"];
+  });
+  localStorage.setItem("acc_lows_"+STATION, JSON.stringify(accData));
+  fetch("/api/accuracy?station="+STATION,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(accData)});
+  buildDefaultForm();
+  document.getElementById("default-status").textContent = "Defaults cleared";
+  renderPreview();
+}
+
 function loadFromJSON(){
   var raw = document.getElementById("json-paste").value.trim();
   var status = document.getElementById("json-status");
@@ -976,6 +1096,15 @@ function loadFromJSON(){
     var parsed = JSON.parse(raw);
     var keys = Object.keys(parsed);
     if(!keys.length){ status.style.color="var(--red)"; status.textContent="No models found."; return; }
+    // Preserve existing default run values when importing new JSON
+    keys.forEach(function(m){
+      if(accData[m] && accData[m].runs && accData[m].runs["default"]){
+        if(!parsed[m].runs) parsed[m].runs = {};
+        if(!parsed[m].runs["default"]){
+          parsed[m].runs["default"] = accData[m].runs["default"];
+        }
+      }
+    });
     accData = parsed;
     MODELS = keys.filter(function(m){ return m !== "NWS"; });
     localStorage.setItem("acc_lows_"+STATION, JSON.stringify(parsed));
@@ -986,11 +1115,11 @@ function loadFromJSON(){
         status.style.color="var(--green)";
         status.textContent = "Loaded "+keys.length+" models at "+new Date().toLocaleTimeString();
         document.getElementById("json-paste").value="";
-        buildForms(); renderPreview(); poll();
+        buildForms(); buildDefaultForm(); renderPreview(); poll();
       }).catch(function(e){
         status.style.color="var(--yellow)";
         status.textContent = "Saved locally (server: "+e.message+"). Will sync on next refresh.";
-        buildForms(); renderPreview();
+        buildForms(); buildDefaultForm(); renderPreview();
       });
   } catch(e) {
     status.style.color="var(--red)"; status.textContent="Invalid JSON: "+e.message;
@@ -1012,6 +1141,10 @@ function saveAccuracy(){
       var corr_el = document.getElementById("rm-corr-"+m+"-"+r);
       data[m].runs[r] = { mae: mae_el ? mae_el.value : "", correction: corr_el ? corr_el.value : "" };
     });
+    // Preserve defaults when saving manual entries
+    if(accData[m] && accData[m].runs && accData[m].runs["default"]){
+      data[m].runs["default"] = accData[m].runs["default"];
+    }
   });
   accData = data;
   localStorage.setItem("acc_lows_"+STATION, JSON.stringify(data));
@@ -1024,7 +1157,7 @@ function clearAccuracy(){
   accData = {}; MODELS = [];
   localStorage.removeItem("acc_lows_"+STATION); localStorage.removeItem("acc_lows_"+STATION+"_time");
   fetch("/api/accuracy?station="+STATION,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({})});
-  buildForms(); renderPreview();
+  buildForms(); buildDefaultForm(); renderPreview();
   document.getElementById("save-status").textContent="Cleared";
 }
 
@@ -1040,14 +1173,17 @@ function renderPreview(){
   var mods = Object.keys(accData);
   document.getElementById("prev-tbody").innerHTML = mods.map(function(m,i){
     var a = accData[m]||{};
-    var runs = Object.entries(a.runs||{}).filter(function(e){ return e[1].mae||e[1].correction; }).map(function(e){ return e[0]; }).join(", ")||"--";
+    var defRd = (a.runs||{})["default"]||{};
+    var namedRuns = Object.keys(a.runs||{}).filter(function(r){ return r!=="default"; }).filter(function(r){ return (a.runs||{})[r].mae||(a.runs||{})[r].correction; }).join(", ")||"--";
     var bg = i%2?"background:#0a1018":"";
     return '<tr style="'+bg+'">'
       +'<td style="color:#e8f0f8;font-weight:600">'+m+'</td>'
       +'<td style="color:'+maeColor(a.mae)+'">'+(a.mae?fmt1(a.mae)+"F":"--")+'</td>'
       +'<td style="color:'+corrColor(a.correction)+'">'+(a.correction!=null&&a.correction!==""?fmtC(a.correction):"--")+'</td>'
       +'<td style="color:var(--dim)">'+(a.rmse?fmt1(a.rmse)+"F":"--")+'</td>'
-      +'<td style="color:var(--dim);font-size:11px">'+runs+'</td></tr>';
+      +'<td style="color:'+(defRd.mae?maeColor(defRd.mae):"var(--dimmer)")+'">'+(defRd.mae?fmt1(defRd.mae)+"F":'<span style="color:#2a3a50">—</span>')+'</td>'
+      +'<td style="color:'+(defRd.correction!=null&&defRd.correction!==""?corrColor(defRd.correction):"var(--dimmer)")+'">'+(defRd.correction!=null&&defRd.correction!==""?fmtC(defRd.correction):'<span style="color:#2a3a50">—</span>')+'</td>'
+      +'<td style="color:var(--dim);font-size:11px">'+namedRuns+'</td></tr>';
   }).join("");
 }
 
@@ -1082,12 +1218,16 @@ function render(data){
 
   document.getElementById("main-tbody").innerHTML = rows.map(function(r,i){
     var bg = i%2?"background:#0a1018":"";
+    // Correction source badge
+    var corrBadge = "";
+    if(r.corr_source === "run") corrBadge = ' <span style="font-size:9px;color:#38bdf8">R</span>';
+    else if(r.corr_source === "default") corrBadge = ' <span style="font-size:9px;color:var(--orange);font-weight:700" title="Using default fallback">D</span>';
     return '<tr style="'+bg+'">'
       +'<td style="color:var(--dim)">#'+r.rank+'</td>'
       +'<td style="color:#e8f0f8;font-weight:600">'+r.model+'</td>'
       +'<td style="color:var(--dim);font-size:11px">'+(r.run||"--")+'</td>'
       +'<td style="color:var(--ice)">'+(r.raw_low!=null?r.raw_low+"F":"--")+'</td>'
-      +'<td style="color:'+corrColor(r.correction)+'">'+(r.correction!=null&&r.correction!==""?fmtC(r.correction)+(r.corr_source==="run"?' <span style="font-size:9px;color:#38bdf8">R</span>':''):"--")+'</td>'
+      +'<td style="color:'+corrColor(r.correction)+'">'+(r.correction!=null&&r.correction!==""?fmtC(r.correction)+corrBadge:"--")+'</td>'
       +'<td style="color:var(--blue);font-weight:600">'+(r.adj_low!=null?r.adj_low+"F":"--")+'</td>'
       +'<td style="color:'+(r.pace!=null?paceColor(r.pace):"#1e2e42")+'">'+(r.pace!=null?(r.pace>=0?"+":"")+r.pace+"F":"--")+'</td>'
       +'<td style="color:var(--dim);font-size:11px">'+(r.low_time||"--")+'</td>'
@@ -1107,8 +1247,16 @@ function render(data){
     }).join("");
   }
 
+  // Run Accuracy tab — includes DEFAULT column
   document.getElementById("runview-tbody").innerHTML = rows.map(function(r,i){
     var bg = i%2?"background:#0a1018":"";
+    var defRd = (r.runs||{})["default"]||{};
+    var defCell = (defRd.mae||defRd.correction)
+      ?'<td class="default-col" style="text-align:center"><div style="line-height:1.8">'
+        +(defRd.mae?'<div style="color:'+maeColor(defRd.mae)+'">'+fmt1(defRd.mae)+'F</div>':'')
+        +(defRd.correction!=null&&defRd.correction!==""?'<div style="color:'+corrColor(defRd.correction)+'">'+fmtC(defRd.correction)+'</div>':'')
+        +'</div></td>'
+      :'<td class="default-col" style="text-align:center"><span style="color:#1e2e42">--</span></td>';
     var cells = MANUAL_RUNS.map(function(run){
       var rd = (r.runs||{})[run]||{};
       var has = rd.mae||rd.correction;
@@ -1117,18 +1265,22 @@ function render(data){
           (rd.correction!=null&&rd.correction!==""?'<div style="color:'+corrColor(rd.correction)+'">'+fmtC(rd.correction)+'</div>':'')+'</div>'
         :'<span style="color:#1e2e42">--</span>')+'</td>';
     }).join("");
-    return '<tr style="'+bg+'"><td style="color:#e8f0f8;font-weight:600">'+r.model+'</td>'+cells+'</tr>';
+    return '<tr style="'+bg+'"><td style="color:#e8f0f8;font-weight:600">'+r.model+'</td>'+defCell+cells+'</tr>';
   }).join("");
 
   document.getElementById("run-cards").innerHTML = rows.map(function(r){
     var runKey = r.run ? r.run.replace(/[^0-9]/g,"").slice(0,2)+"Z" : "";
     var rd = (r.runs||{})[runKey]||{};
     var hasC = rd.correction!=null&&rd.correction!=="";
-    return '<div style="background:#0b1520;border:1px solid var(--border);border-radius:5px;padding:8px 12px;min-width:120px">'
+    // Show if default is active
+    var usingDefault = !hasC && (r.runs||{})["default"] && ((r.runs||{})["default"].correction!=null&&(r.runs||{})["default"].correction!=="");
+    var defRd = (r.runs||{})["default"]||{};
+    return '<div style="background:#0b1520;border:1px solid '+(usingDefault?"var(--orange)":"var(--border)")+';border-radius:5px;padding:8px 12px;min-width:120px">'
       +'<div style="font-size:11px;color:#8aabcc;font-weight:600">'+r.model+'</div>'
       +'<div style="font-size:13px;color:var(--ice);margin-top:2px">'+(r.run||"--")+'</div>'
-      +(hasC?'<div style="font-size:11px;color:'+corrColor(rd.correction)+';margin-top:2px">Corr: '+fmtC(rd.correction)+'</div>'
-             :'<div style="font-size:10px;color:#2a4060;margin-top:2px">No run corr</div>')
+      +(hasC?'<div style="font-size:11px;color:'+corrColor(rd.correction)+';margin-top:2px">Corr: '+fmtC(rd.correction)+' <span style="font-size:9px;color:#38bdf8">R</span></div>'
+        :usingDefault?'<div style="font-size:11px;color:var(--orange);margin-top:2px">Default: '+fmtC(defRd.correction)+' <span style="font-size:9px">D</span></div>'
+        :'<div style="font-size:10px;color:#2a4060;margin-top:2px">No run corr</div>')
       +'</div>';
   }).join("");
 
@@ -1211,7 +1363,7 @@ function startCountdown(){
   },1000);
 }
 
-buildForms(); renderPreview();
+buildForms(); buildDefaultForm(); renderPreview();
 startCountdown(); setInterval(poll,1200000);
 if(Object.keys(accData).length){
   fetch("/api/accuracy?station="+STATION,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(accData)})
@@ -1350,7 +1502,6 @@ function submitVerification(){
   var status = document.getElementById("verif-status");
   if(!actual){ status.style.color="var(--red)"; status.textContent="Actual value required."; return; }
   if(!date || date.length < 8){
-    // fallback: yesterday
     var d2 = new Date(); d2.setDate(d2.getDate()-1);
     date = d2.toISOString().slice(0,10);
   }
@@ -1424,11 +1575,3 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
-
-
-
-
-
-
-
