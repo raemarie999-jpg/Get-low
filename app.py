@@ -45,6 +45,17 @@ ALL_KNOWN_MODELS = [
 ]
 REFRESH_SEC = 1200
 
+# --- Rate limiting: pace every wethr API request ---
+_api_lock = threading.Lock()
+_last_request_time = 0
+MIN_REQUEST_INTERVAL = 2.5  # seconds between API calls
+
+# --- Manual refresh cooldown: stops external pings / rapid re-clicks from
+# bypassing REFRESH_SEC and spawning unlimited fetch_all() runs ---
+_manual_refresh_lock = threading.Lock()
+_last_manual_refresh = {}
+MANUAL_REFRESH_COOLDOWN_SEC = 120  # min seconds between manual refreshes, per station
+
 def make_state():
     return {
         "obs": None,
@@ -65,7 +76,7 @@ def get_state(station=None):
 
 def active_models(station="KPHL"):
     acc = get_state(station).get("accuracy", {})
-    return [m for m in acc.keys() if m != "NWS"] if acc else ALL_KNOWN_MODELS
+    return [m for m in acc.keys() if m != "NWS"] if acc else []
 
 def add_log(msg, level="info", station="KPHL"):
     entry = {"t": datetime.now().strftime("%H:%M:%S"), "msg": msg, "level": level}
@@ -74,7 +85,17 @@ def add_log(msg, level="info", station="KPHL"):
     st["log"] = st["log"][:100]
     print(f"[{station}][{entry['t']}] {msg}")
 
+def _throttle():
+    global _last_request_time
+    with _api_lock:
+        now = time.monotonic()
+        wait = MIN_REQUEST_INTERVAL - (now - _last_request_time)
+        if wait > 0:
+            time.sleep(wait)
+        _last_request_time = time.monotonic()
+
 def wethr_get(path):
+    _throttle()
     r = requests.get(
         f"https://wethr.net/api/v2/{path}",
         headers={"X-API-Key": API_KEY},
@@ -292,7 +313,7 @@ def rollup_daily_history(station="KPHL"):
 def build_snapshot_rows(station="KPHL"):
     st = get_state(station)
     acc = st["accuracy"]
-    models = [m for m in acc.keys() if m != "NWS"] if acc else ALL_KNOWN_MODELS
+    models = [m for m in acc.keys() if m != "NWS"] if acc else []
     obs_temp = (st["obs"] or {}).get("temperature_display")
     rows = []
     for model in models:
@@ -521,6 +542,14 @@ def manual_refresh():
     station = request.args.get("station", "KPHL").upper()
     if station not in STATIONS:
         station = "KPHL"
+    with _manual_refresh_lock:
+        now = time.monotonic()
+        elapsed = now - _last_manual_refresh.get(station, 0)
+        if elapsed < MANUAL_REFRESH_COOLDOWN_SEC:
+            remaining = round(MANUAL_REFRESH_COOLDOWN_SEC - elapsed)
+            add_log(f"Manual refresh ignored (cooldown, {remaining}s left)", "warn", station)
+            return jsonify({"ok": False, "cooldown": True, "remaining_sec": remaining})
+        _last_manual_refresh[station] = now
     threading.Thread(target=fetch_all, args=(station,), daemon=True).start()
     return jsonify({"ok": True})
 
@@ -1565,7 +1594,7 @@ def start_background():
             _started = True
             for station in STATIONS:
                 load_accuracy(station)
-            t = threading.Thread(target=background_loop, daemon=True)
+            t = threading.Thread(target=background_loop, daemon=True, name="bgloop")
             t.start()
             print("Background loop started")
 
