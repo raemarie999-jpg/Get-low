@@ -1,5 +1,6 @@
 import os, json, time, threading
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, request, render_template_string
 import requests
 
@@ -56,6 +57,56 @@ _manual_refresh_lock = threading.Lock()
 _last_manual_refresh = {}
 MANUAL_REFRESH_COOLDOWN_SEC = 120  # min seconds between manual refreshes, per station
 
+# --- Hard daily API cap: resets at 3:30pm EST (America/New_York handles DST) ---
+DAILY_REQUEST_CAP = 2500
+_CAP_TZ = ZoneInfo("America/New_York")
+_CAP_RESET_HOUR = 15
+_CAP_RESET_MINUTE = 30
+_counter_lock = threading.Lock()
+
+class DailyCapExceeded(Exception):
+    pass
+
+def _get_period_key():
+    """Returns string key for the current quota period (starts at 3:30pm EST)."""
+    now = datetime.now(_CAP_TZ)
+    reset_today = now.replace(hour=_CAP_RESET_HOUR, minute=_CAP_RESET_MINUTE, second=0, microsecond=0)
+    period_start = reset_today if now >= reset_today else reset_today - timedelta(days=1)
+    return period_start.strftime("%Y-%m-%d_%H%M")
+
+def _load_api_counter():
+    try:
+        with open(f"{DATA_DIR}/api_counter_lows.json") as f:
+            return json.load(f)
+    except:
+        return {}
+
+def _save_api_counter(data):
+    try:
+        ensure_data_dir()
+        tmp = f"{DATA_DIR}/api_counter_lows.json.tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, f"{DATA_DIR}/api_counter_lows.json")
+    except Exception as e:
+        print(f"Counter save error: {e}")
+
+def _check_and_increment():
+    """Raises DailyCapExceeded if at or over cap; otherwise increments and saves."""
+    with _counter_lock:
+        period = _get_period_key()
+        data = _load_api_counter()
+        count = data.get(period, 0)
+        if count >= DAILY_REQUEST_CAP:
+            raise DailyCapExceeded(f"Daily cap ({DAILY_REQUEST_CAP}) reached. Resets at 3:30pm EST.")
+        data[period] = count + 1
+        keys = sorted(data.keys())
+        if len(keys) > 3:
+            for k in keys[:-3]:
+                del data[k]
+        _save_api_counter(data)
+        return data[period]
+
 def make_state():
     return {
         "obs": None,
@@ -95,6 +146,7 @@ def _throttle():
         _last_request_time = time.monotonic()
 
 def wethr_get(path):
+    _check_and_increment()  # raises DailyCapExceeded before any sleep/request
     _throttle()
     r = requests.get(
         f"https://wethr.net/api/v2/{path}",
@@ -168,6 +220,13 @@ def fetch_all(station="KPHL"):
     if not API_KEY:
         add_log("No API key set", "err", station)
         return
+    # Check cap before doing anything
+    counter_data = _load_api_counter()
+    period = _get_period_key()
+    current_count = counter_data.get(period, 0)
+    if current_count >= DAILY_REQUEST_CAP:
+        add_log(f"Daily API cap reached ({current_count}/{DAILY_REQUEST_CAP}) — skipping fetch. Resets 3:30pm EST.", "warn", station)
+        return
     add_log("Fetching data...", "info", station)
     errors = []
 
@@ -176,6 +235,9 @@ def fetch_all(station="KPHL"):
         obs = wethr_get(f"observations.php?station_code={station}&mode=latest")
         st["obs"] = obs
         add_log(f"Obs: {obs.get('temperature_display')}F", "ok", station)
+    except DailyCapExceeded:
+        add_log(f"Daily cap reached — stopping fetch. Resets 3:30pm EST.", "warn", station)
+        return
     except Exception as e:
         errors.append(f"Obs: {e}")
         add_log(f"Obs error: {e}", "err", station)
@@ -185,6 +247,9 @@ def fetch_all(station="KPHL"):
         wl = wethr_get(f"observations.php?station_code={station}&mode=wethr_low&logic=nws")
         st["wethr_low"] = wl
         add_log(f"Wethr Low: {wl.get('wethr_low')}F", "ok", station)
+    except DailyCapExceeded:
+        add_log(f"Daily cap reached — stopping fetch. Resets 3:30pm EST.", "warn", station)
+        return
     except Exception as e:
         errors.append(f"WethrLow: {e}")
         add_log(f"Wethr Low error: {e}", "err", station)
@@ -231,6 +296,9 @@ def fetch_all(station="KPHL"):
                     "window_entries": len(window),
                 }
                 add_log(f"{model}: low={raw_temp} now={current_temp} run={run_fmt} ({len(window)} entries)", "ok", station)
+        except DailyCapExceeded:
+            add_log(f"Daily cap reached mid-fetch — stopping. Resets 3:30pm EST.", "warn", station)
+            break
         except Exception as e:
             errors.append(f"{model}: {e}")
             add_log(f"{model} error: {str(e)[:80]}", "warn", station)
@@ -536,6 +604,20 @@ def api_consensus_snapshots():
     st = get_state(station)
     disk = load_json_file(f"{DATA_DIR}/consensus_{station}.json", {})
     return jsonify({"today": st.get("consensus_snapshots", []), "history": disk, "station": station})
+
+@app.route("/api/quota")
+def api_quota():
+    period = _get_period_key()
+    data = _load_api_counter()
+    count = data.get(period, 0)
+    return jsonify({
+        "period": period,
+        "count": count,
+        "cap": DAILY_REQUEST_CAP,
+        "remaining": max(0, DAILY_REQUEST_CAP - count),
+        "paused": count >= DAILY_REQUEST_CAP,
+        "resets": "3:30pm EST daily",
+    })
 
 @app.route("/api/refresh", methods=["POST"])
 def manual_refresh():
