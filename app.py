@@ -1,6 +1,5 @@
 import os, json, time, threading
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, request, render_template_string
 import requests
 
@@ -9,7 +8,7 @@ app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024
 
 API_KEY = os.environ.get("WETHR_API_KEY", "")
 DATA_DIR = "/data"
-REFRESH_SEC = 1200  # 20 minutes
+REFRESH_SEC = 1800  # 30 minutes
 
 def ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -44,7 +43,7 @@ ALL_KNOWN_MODELS = [
     "ARPEGE","HRRR","UKMO","LAV-MOS","NAM","RAP","GEM-GDPS","NAM-MOS","NBM",
     "NAM4KM","GFS","ICON","GFS-MOS","ECMWF-HRES","GEFS","JMA","RDPS","SREF"
 ]
-REFRESH_SEC = 1200
+REFRESH_SEC = 1800
 
 # --- Rate limiting: pace every wethr API request ---
 _api_lock = threading.Lock()
@@ -57,20 +56,21 @@ _manual_refresh_lock = threading.Lock()
 _last_manual_refresh = {}
 MANUAL_REFRESH_COOLDOWN_SEC = 120  # min seconds between manual refreshes, per station
 
-# --- Hard daily API cap: resets at 3:30pm EST (America/New_York handles DST) ---
+# --- Hard daily API cap: resets at 19:30 UTC (= 3:30pm EDT / 2:30pm EST) ---
 DAILY_REQUEST_CAP = 2500
-_CAP_TZ = ZoneInfo("America/New_York")
-_CAP_RESET_HOUR = 15
-_CAP_RESET_MINUTE = 30
+_CAP_RESET_UTC_HOUR = 19
+_CAP_RESET_UTC_MINUTE = 30
 _counter_lock = threading.Lock()
 
 class DailyCapExceeded(Exception):
     pass
 
 def _get_period_key():
-    """Returns string key for the current quota period (starts at 3:30pm EST)."""
-    now = datetime.now(_CAP_TZ)
-    reset_today = now.replace(hour=_CAP_RESET_HOUR, minute=_CAP_RESET_MINUTE, second=0, microsecond=0)
+    """Returns string key for the current quota period.
+    Resets at 19:30 UTC (3:30pm EDT in summer; shifts 1hr in winter — acceptable).
+    """
+    now = datetime.utcnow()
+    reset_today = now.replace(hour=_CAP_RESET_UTC_HOUR, minute=_CAP_RESET_UTC_MINUTE, second=0, microsecond=0)
     period_start = reset_today if now >= reset_today else reset_today - timedelta(days=1)
     return period_start.strftime("%Y-%m-%d_%H%M")
 
