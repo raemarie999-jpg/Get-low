@@ -1459,13 +1459,9 @@ function manualRefresh(){
   fetch("/api/refresh?station="+STATION,{method:"POST"});
   countdown=1200;
   document.getElementById("stxt").textContent="Fetching...";
-  var _refreshPolls = 0;
-  function _pollUntilFresh(){
-    poll();
-    if(++_refreshPolls < 10) setTimeout(_pollUntilFresh, 15000);
-    else _refreshPolls = 0;
-  }
-  setTimeout(_pollUntilFresh, 10000);
+  setTimeout(poll,5000);
+  setTimeout(poll,20000);
+  setTimeout(poll,40000);
 }
 
 function startCountdown(){
