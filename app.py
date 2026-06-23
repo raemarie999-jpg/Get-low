@@ -54,7 +54,7 @@ MIN_REQUEST_INTERVAL = 2.5  # seconds between API calls
 # bypassing REFRESH_SEC and spawning unlimited fetch_all() runs ---
 _manual_refresh_lock = threading.Lock()
 _last_manual_refresh = {}
-MANUAL_REFRESH_COOLDOWN_SEC = 120  # min seconds between manual refreshes, per station
+MANUAL_REFRESH_COOLDOWN_SEC = 30  # min seconds between manual refreshes, per station
 
 # --- Hard daily API cap: resets at 19:30 UTC (= 3:30pm EDT / 2:30pm EST) ---
 DAILY_REQUEST_CAP = 2500
@@ -536,7 +536,7 @@ def api_state():
             "rank": i+1, "model": model,
             "run": fcst.get("run", "—"),
             "raw_low": raw, "correction": corr,
-            "corr_source": corr_source,   # "run", "default", or "overall"
+            "corr_source": corr_source,
             "adj_low": adj, "pace": pace,
             "low_time": fcst.get("low_time"),
             "mae": display_mae, "rmse": a.get("rmse"),
@@ -1139,9 +1139,6 @@ function buildDefaultForm(){
     var a = accData[m]||{};
     var rd = (a.runs||{})["default"]||{};
     var bg = i%2?"background:#0a1018":"";
-    // Show currently active run for context
-    var activeRun = "—";
-    // We don't have live run info here, just show what named runs exist
     var namedRuns = Object.keys(a.runs||{}).filter(function(r){ return r!=="default"; }).join(", ")||"none";
     return '<tr style="'+bg+'">'
       +'<td style="color:#e8f0f8;font-weight:600">'+m+'</td>'
@@ -1155,7 +1152,6 @@ function buildDefaultForm(){
 function saveDefaults(){
   var mods = MODELS.length ? MODELS : [];
   var status = document.getElementById("default-status");
-  // Merge default values into existing accData runs
   mods.forEach(function(m){
     if(!accData[m]) accData[m] = {};
     if(!accData[m].runs) accData[m].runs = {};
@@ -1166,7 +1162,6 @@ function saveDefaults(){
     if(mae || corr){
       accData[m].runs["default"] = { mae: mae, correction: corr };
     } else {
-      // Clear the default if both fields are empty
       delete accData[m].runs["default"];
     }
   });
@@ -1178,7 +1173,6 @@ function saveDefaults(){
       status.textContent = "Defaults saved at "+new Date().toLocaleTimeString();
       renderPreview();
     }).catch(function(e){
-      // Saved locally at least
       localStorage.setItem("acc_lows_"+STATION, JSON.stringify(accData));
       status.style.color="var(--yellow)";
       status.textContent = "Saved locally (server: "+e.message+")";
@@ -1207,7 +1201,6 @@ function loadFromJSON(){
     var parsed = JSON.parse(raw);
     var keys = Object.keys(parsed);
     if(!keys.length){ status.style.color="var(--red)"; status.textContent="No models found."; return; }
-    // Preserve existing default run values when importing new JSON
     keys.forEach(function(m){
       if(accData[m] && accData[m].runs && accData[m].runs["default"]){
         if(!parsed[m].runs) parsed[m].runs = {};
@@ -1252,7 +1245,6 @@ function saveAccuracy(){
       var corr_el = document.getElementById("rm-corr-"+m+"-"+r);
       data[m].runs[r] = { mae: mae_el ? mae_el.value : "", correction: corr_el ? corr_el.value : "" };
     });
-    // Preserve defaults when saving manual entries
     if(accData[m] && accData[m].runs && accData[m].runs["default"]){
       data[m].runs["default"] = accData[m].runs["default"];
     }
@@ -1329,7 +1321,6 @@ function render(data){
 
   document.getElementById("main-tbody").innerHTML = rows.map(function(r,i){
     var bg = i%2?"background:#0a1018":"";
-    // Correction source badge
     var corrBadge = "";
     if(r.corr_source === "run") corrBadge = ' <span style="font-size:9px;color:#38bdf8">R</span>';
     else if(r.corr_source === "default") corrBadge = ' <span style="font-size:9px;color:var(--orange);font-weight:700" title="Using default fallback">D</span>';
@@ -1358,7 +1349,6 @@ function render(data){
     }).join("");
   }
 
-  // Run Accuracy tab — includes DEFAULT column
   document.getElementById("runview-tbody").innerHTML = rows.map(function(r,i){
     var bg = i%2?"background:#0a1018":"";
     var defRd = (r.runs||{})["default"]||{};
@@ -1383,7 +1373,6 @@ function render(data){
     var runKey = r.run ? r.run.replace(/[^0-9]/g,"").slice(0,2)+"Z" : "";
     var rd = (r.runs||{})[runKey]||{};
     var hasC = rd.correction!=null&&rd.correction!=="";
-    // Show if default is active
     var usingDefault = !hasC && (r.runs||{})["default"] && ((r.runs||{})["default"].correction!=null&&(r.runs||{})["default"].correction!=="");
     var defRd = (r.runs||{})["default"]||{};
     return '<div style="background:#0b1520;border:1px solid '+(usingDefault?"var(--orange)":"var(--border)")+';border-radius:5px;padding:8px 12px;min-width:120px">'
@@ -1462,6 +1451,10 @@ function manualRefresh(){
   setTimeout(poll,5000);
   setTimeout(poll,20000);
   setTimeout(poll,40000);
+  setTimeout(poll,60000);
+  setTimeout(poll,90000);
+  setTimeout(poll,120000);
+  setTimeout(poll,150000);
 }
 
 function startCountdown(){
@@ -1476,7 +1469,7 @@ function startCountdown(){
 }
 
 buildForms(); buildDefaultForm(); renderPreview();
-startCountdown(); setInterval(poll,1200000);
+startCountdown();
 if(Object.keys(accData).length){
   fetch("/api/accuracy?station="+STATION,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(accData)})
     .then(function(){ poll(); }).catch(function(){ poll(); });
