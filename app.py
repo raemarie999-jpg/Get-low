@@ -274,11 +274,11 @@ def get_low_window(station="KPHL"):
     now_local = station_local_now(station)
     if now_local.hour > 9 or (now_local.hour == 9 and now_local.minute >= 30):
         tomorrow = now_local.replace(hour=1, minute=0, second=0, microsecond=0) + timedelta(days=1)
-        window_start_utc = tomorrow - timedelta(hours=tz_offset)
+        window_start_utc = tomorrow + timedelta(hours=abs(tz_offset))
         window_end_utc = window_start_utc + timedelta(hours=24)
     else:
         today_1am = now_local.replace(hour=1, minute=0, second=0, microsecond=0)
-        window_start_utc = today_1am - timedelta(hours=tz_offset)
+        window_start_utc = today_1am + timedelta(hours=abs(tz_offset))
         window_end_utc = window_start_utc + timedelta(hours=24)
     return window_start_utc, window_end_utc
 
@@ -618,7 +618,7 @@ def api_state():
     acc = st["accuracy"]
     models = active_models(station)
     rows = []
-    window_start, window_end = get_low_window()
+    window_start, window_end = get_low_window(station)
     for i, model in enumerate(models):
         a = acc.get(model, {})
         fcst = st["forecasts"].get(model, {})
