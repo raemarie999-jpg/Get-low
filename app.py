@@ -189,7 +189,7 @@ def wethr_get(path):
     r = requests.get(
         f"https://wethr.net/api/v2/{path}",
         headers={"X-API-Key": API_KEY},
-        timeout=6
+        timeout=(5, 10)
     )
     r.raise_for_status()
     return r.json()
