@@ -577,17 +577,18 @@ def save_consensus_snapshot(station="KPHL"):
         add_log(f"Consensus snapshot error: {e}", "warn", station)
 
 def scheduled_fetch():
-    """Auto-fetch background stations only. All 10 stations are valid and fetchable
-    on demand via the NOW button; only BACKGROUND_STATIONS run automatically.
+    """Auto-fetch background stations only. Sequential with sleep gaps — no blocking
+    join so a slow station cannot stall the next one or blow a timeout.
     """
     for i, station in enumerate(BACKGROUND_STATIONS):
         if i > 0:
-            time.sleep(30)
-        t = threading.Thread(target=fetch_all, args=(station,), daemon=True)
-        t.start()
-        t.join(timeout=120)
-        if t.is_alive():
-            add_log("Fetch timed out", "err", station)
+            gap = 10 + random.uniform(2, 5)
+            add_log(f"Waiting {gap:.0f}s before fetching next station", "info", BACKGROUND_STATIONS[i-1])
+            time.sleep(gap)
+        try:
+            fetch_all(station)
+        except Exception as e:
+            add_log(f"scheduled_fetch error: {e}", "err", station)
 
 def background_loop():
     while True:
