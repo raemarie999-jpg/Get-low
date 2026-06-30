@@ -1079,16 +1079,8 @@ function switchStation(s){
   clearDisplay();
   try { accData = JSON.parse(localStorage.getItem("acc_lows_"+s) || "{}"); } catch(e){ accData = {}; }
   MODELS = Object.keys(accData).filter(function(m){ return m !== "NWS"; });
-  ["KPHL","KATL","KOKC"].forEach(function(st){
-    var btn = document.getElementById("btn-"+st);
-    if(st === s){
-      btn.style.background="#1e40af"; btn.style.borderColor="#3b82f6"; btn.style.color="#93c5fd";
-    } else {
-      btn.style.background="none"; btn.style.borderColor="#334155"; btn.style.color="#64748b";
-    }
-  });
-  var names = {"KPHL":"Philadelphia International Airport","KATL":"Atlanta Hartsfield-Jackson Airport","KOKC":"Oklahoma City Will Rogers World Airport"};
-  document.getElementById("h-sub").textContent = names[s] || s;
+  updateStationButtons();
+  document.getElementById("h-sub").textContent = STATION_NAMES_JS[s] || s;
   buildForms(); buildDefaultForm(); renderPreview(); poll();
 }
 
