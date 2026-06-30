@@ -1,4 +1,4 @@
-import os, json, time, threading
+import os, json, time, threading, random
 from datetime import datetime, timedelta
 from flask import Flask, jsonify, request, render_template_string
 import requests
@@ -32,12 +32,30 @@ def save_json_file(path, data):
         add_log(f"Save error {path}: {e}", "err")
         return False
 
-STATIONS = ["KPHL", "KATL", "KOKC"]
+STATIONS = ["KPHL","KATL","KOKC","KDCA","KBOS","KDEN","KHOU","KLAS","KMDW","KMSP"]
 STATION_NAMES = {
     "KPHL": "Philadelphia International Airport",
     "KATL": "Atlanta Hartsfield-Jackson Airport",
     "KOKC": "Oklahoma City Will Rogers World Airport",
+    "KDCA": "Washington Reagan National Airport",
+    "KBOS": "Boston Logan International Airport",
+    "KDEN": "Denver International Airport",
+    "KHOU": "Houston William P. Hobby Airport",
+    "KLAS": "Las Vegas Harry Reid International Airport",
+    "KMDW": "Chicago Midway International Airport",
+    "KMSP": "Minneapolis-Saint Paul International Airport",
 }
+STATION_TZ_OFFSET = {
+    "KPHL": -5, "KATL": -5, "KOKC": -6, "KDCA": -5, "KBOS": -5,
+    "KDEN": -7, "KHOU": -6, "KLAS": -8, "KMDW": -6, "KMSP": -6,
+}
+BACKGROUND_STATIONS = ["KPHL", "KATL", "KOKC"]
+STATION_LON = {
+    "KPHL": -75.2408, "KATL": -84.4277, "KOKC": -97.6007,
+    "KDCA": -77.0377, "KBOS": -71.0052, "KDEN": -104.6737,
+    "KHOU": -95.2789, "KLAS": -115.1523, "KMDW": -87.7524, "KMSP": -93.2218,
+}
+_SKY_COVER_MAP = {"CLR": 0, "SKC": 0, "FEW": 1, "SCT": 3, "BKN": 5, "OVC": 7, "OVX": 8}
 
 ALL_KNOWN_MODELS = [
     "ARPEGE","HRRR","UKMO","LAV-MOS","NAM","RAP","GEM-GDPS","NAM-MOS","NBM",
@@ -471,14 +489,16 @@ def save_consensus_snapshot(station="KPHL"):
         add_log(f"Consensus snapshot error: {e}", "warn", station)
 
 def scheduled_fetch():
-    for i, station in enumerate(STATIONS):
+    """Auto-fetch background stations only. Sequential with sleep gaps."""
+    for i, station in enumerate(BACKGROUND_STATIONS):
         if i > 0:
-            time.sleep(30)
-        t = threading.Thread(target=fetch_all, args=(station,), daemon=True)
-        t.start()
-        t.join(timeout=120)
-        if t.is_alive():
-            add_log("Fetch timed out", "err", station)
+            gap = 10 + random.uniform(2, 5)
+            add_log(f"Waiting {gap:.0f}s before next station", "info", BACKGROUND_STATIONS[i-1])
+            time.sleep(gap)
+        try:
+            fetch_all(station)
+        except Exception as e:
+            add_log(f"scheduled_fetch error: {e}", "err", station)
 
 def background_loop():
     while True:
@@ -755,6 +775,9 @@ input[type=number]:focus{border-color:var(--ice)}
 .logbox{background:#060a0e;border-radius:4px;padding:12px;max-height:400px;overflow-y:auto}
 .pill-y{background:#facc1522;color:var(--yellow);border-radius:3px;padding:2px 7px;font-size:10px;font-weight:600}
 .pill-g{background:#4ade8022;color:var(--green);border-radius:3px;padding:2px 7px;font-size:10px;font-weight:600}
+.stn-btn{border-radius:4px;padding:5px 12px;font-size:11px;cursor:pointer;font-family:inherit;letter-spacing:1px;transition:all .15s}
+.stn-btn.active{background:#1e40af;border:1px solid #3b82f6;color:#93c5fd}
+.stn-btn.inactive{background:none;border:1px solid #334155;color:#64748b}
 .window-badge{background:#a5f3fc22;color:var(--ice);border-radius:3px;padding:2px 8px;font-size:10px;font-weight:600;letter-spacing:1px}
 /* Default run column highlight */
 .default-col{background:#fb923c0d !important}
@@ -791,11 +814,7 @@ th.default-col{color:var(--orange) !important}
       <div style="font-size:11px;font-weight:600;color:var(--ice);margin-top:4px" id="h-window">--</div>
     </div>
     <div class="sp"></div>
-    <div style="display:flex;gap:6px;align-items:center">
-      <button id="btn-KPHL" onclick="switchStation('KPHL')" style="background:#1e40af;border:1px solid #3b82f6;color:#93c5fd;border-radius:4px;padding:5px 12px;font-size:11px;cursor:pointer;font-family:inherit;letter-spacing:1px">KPHL</button>
-      <button id="btn-KATL" onclick="switchStation('KATL')" style="background:none;border:1px solid #334155;color:#64748b;border-radius:4px;padding:5px 12px;font-size:11px;cursor:pointer;font-family:inherit;letter-spacing:1px">KATL</button>
-      <button id="btn-KOKC" onclick="switchStation('KOKC')" style="background:none;border:1px solid #334155;color:#64748b;border-radius:4px;padding:5px 12px;font-size:11px;cursor:pointer;font-family:inherit;letter-spacing:1px">KOKC</button>
-    </div>
+    <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap" id="station-btns"></div>
     <div class="sp"></div>
     <div style="text-align:right">
       <div style="display:flex;align-items:center;gap:6px;font-size:10px;color:var(--dim)">
@@ -1052,13 +1071,47 @@ th.default-col{color:var(--orange) !important}
 </main>
 
 <script>
+var STATION_LIST = ["KPHL","KATL","KOKC","KDCA","KBOS","KDEN","KHOU","KLAS","KMDW","KMSP"];
+var STATION_NAMES_JS = {
+  "KPHL":"Philadelphia International Airport",
+  "KATL":"Atlanta Hartsfield-Jackson Airport",
+  "KOKC":"Oklahoma City Will Rogers World Airport",
+  "KDCA":"Washington Reagan National Airport",
+  "KBOS":"Boston Logan International Airport",
+  "KDEN":"Denver International Airport",
+  "KHOU":"Houston William P. Hobby Airport",
+  "KLAS":"Las Vegas Harry Reid International Airport",
+  "KMDW":"Chicago Midway International Airport",
+  "KMSP":"Minneapolis-Saint Paul International Airport"
+};
 var STATION = localStorage.getItem("active_station_lows") || "KPHL";
+if(STATION_LIST.indexOf(STATION) === -1) STATION = "KPHL";
 var MODELS = [];
 var accData = {};
 try { accData = JSON.parse(localStorage.getItem("acc_lows_"+STATION) || "{}"); } catch(e){}
 if(Object.keys(accData).length) MODELS = Object.keys(accData).filter(function(m){ return m !== "NWS"; });
 var countdown = 1200;
 var countdownTimer;
+
+(function(){
+  var container = document.getElementById("station-btns");
+  STATION_LIST.forEach(function(s){
+    var btn = document.createElement("button");
+    btn.id = "btn-"+s;
+    btn.textContent = s;
+    btn.className = "stn-btn " + (s === STATION ? "active" : "inactive");
+    btn.onclick = function(){ switchStation(s); };
+    container.appendChild(btn);
+  });
+})();
+
+function updateStationButtons(){
+  STATION_LIST.forEach(function(s){
+    var btn = document.getElementById("btn-"+s);
+    if(!btn) return;
+    btn.className = "stn-btn " + (s === STATION ? "active" : "inactive");
+  });
+}
 
 function clearDisplay(){
   ["h-obs","h-wl","h-con","s-obs","s-wl","s-con"].forEach(function(id){
