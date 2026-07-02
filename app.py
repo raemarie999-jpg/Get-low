@@ -1,4 +1,4 @@
-import os, json, time, threading, random
+import os, json, time, threading
 from datetime import datetime, timedelta
 from flask import Flask, jsonify, request, render_template_string
 import requests
@@ -32,30 +32,12 @@ def save_json_file(path, data):
         add_log(f"Save error {path}: {e}", "err")
         return False
 
-STATIONS = ["KPHL","KATL","KOKC","KDCA","KBOS","KDEN","KHOU","KLAS","KMDW","KMSP"]
+STATIONS = ["KPHL", "KATL", "KOKC"]
 STATION_NAMES = {
     "KPHL": "Philadelphia International Airport",
     "KATL": "Atlanta Hartsfield-Jackson Airport",
     "KOKC": "Oklahoma City Will Rogers World Airport",
-    "KDCA": "Washington Reagan National Airport",
-    "KBOS": "Boston Logan International Airport",
-    "KDEN": "Denver International Airport",
-    "KHOU": "Houston William P. Hobby Airport",
-    "KLAS": "Las Vegas Harry Reid International Airport",
-    "KMDW": "Chicago Midway International Airport",
-    "KMSP": "Minneapolis-Saint Paul International Airport",
 }
-STATION_TZ_OFFSET = {
-    "KPHL": -5, "KATL": -5, "KOKC": -6, "KDCA": -5, "KBOS": -5,
-    "KDEN": -7, "KHOU": -6, "KLAS": -8, "KMDW": -6, "KMSP": -6,
-}
-BACKGROUND_STATIONS = STATIONS
-STATION_LON = {
-    "KPHL": -75.2408, "KATL": -84.4277, "KOKC": -97.6007,
-    "KDCA": -77.0377, "KBOS": -71.0052, "KDEN": -104.6737,
-    "KHOU": -95.2789, "KLAS": -115.1523, "KMDW": -87.7524, "KMSP": -93.2218,
-}
-_SKY_COVER_MAP = {"CLR": 0, "SKC": 0, "FEW": 1, "SCT": 3, "BKN": 5, "OVC": 7, "OVX": 8}
 
 ALL_KNOWN_MODELS = [
     "ARPEGE","HRRR","UKMO","LAV-MOS","NAM","RAP","GEM-GDPS","NAM-MOS","NBM",
@@ -187,25 +169,23 @@ def parse_vt(x):
     try: return datetime.strptime(vt[:16], "%Y-%m-%d %H:%M")
     except: return None
 
-def local_now(station="KPHL"):
-    offset = STATION_TZ_OFFSET.get(station, -5)
-    return datetime.utcnow() + timedelta(hours=offset)
+def local_now():
+    return datetime.utcnow() - timedelta(hours=5)
 
-def get_low_window(station="KPHL"):
-    offset = STATION_TZ_OFFSET.get(station, -5)
-    now_local = local_now(station)
+def get_low_window():
+    now_local = local_now()
     if now_local.hour > 9 or (now_local.hour == 9 and now_local.minute >= 30):
         tomorrow = now_local.replace(hour=1, minute=0, second=0, microsecond=0) + timedelta(days=1)
-        window_start_utc = tomorrow - timedelta(hours=offset)
+        window_start_utc = tomorrow + timedelta(hours=5)
         window_end_utc = window_start_utc + timedelta(hours=24)
     else:
         today_1am = now_local.replace(hour=1, minute=0, second=0, microsecond=0)
-        window_start_utc = today_1am - timedelta(hours=offset)
+        window_start_utc = today_1am + timedelta(hours=5)
         window_end_utc = window_start_utc + timedelta(hours=24)
     return window_start_utc, window_end_utc
 
-def low_window_entries(temps, station="KPHL"):
-    window_start, window_end = get_low_window(station)
+def low_window_entries(temps):
+    window_start, window_end = get_low_window()
     filtered = [x for x in temps if parse_vt(x) is not None and window_start <= parse_vt(x) < window_end]
     return filtered
 
@@ -280,7 +260,7 @@ def fetch_all(station="KPHL"):
         return
 
     utc_now = datetime.utcnow()
-    window_start, window_end = get_low_window(station)
+    window_start, window_end = get_low_window()
 
     for model in fetch_targets:
         try:
@@ -288,7 +268,7 @@ def fetch_all(station="KPHL"):
             temps = data if isinstance(data, list) else data.get("forecasts", [])
             meta = {} if isinstance(data, list) else data
             if temps:
-                window = low_window_entries(temps, station)
+                window = low_window_entries(temps)
                 if not window:
                     add_log(f"{model}: no entries in low window", "warn", station)
                     continue
@@ -309,8 +289,7 @@ def fetch_all(station="KPHL"):
                 vt = parse_vt(min_entry)
                 low_time = None
                 if vt:
-                    offset = STATION_TZ_OFFSET.get(station, -5)
-                    local_vt = vt + timedelta(hours=offset)
+                    local_vt = vt - timedelta(hours=5)
                     low_time = local_vt.strftime("%-I:%M%p").lower()
 
                 st["forecasts"][model] = {
@@ -339,29 +318,30 @@ def fetch_all(station="KPHL"):
         add_log(f"Snapshot error: {e}", "warn", station)
 
     try:
-        now_local = local_now(station)
+        now_local = local_now()
         if now_local.minute < 20 or (now_local.minute >= 30 and now_local.minute < 50):
             save_consensus_snapshot(station)
     except Exception as e:
         add_log(f"Consensus snapshot error: {e}", "warn", station)
 
-_memory_snapshots = {}  # {station: {date_str: [entries]}}
+_memory_snapshots = {}
 
 def save_pacing_snapshot(rows, station="KPHL"):
     st = get_state(station)
-    now = local_now(station)
+    now = local_now()
     date_str = now.strftime("%Y-%m-%d")
     time_str = now.strftime("%H:%M")
     entry = {"time": time_str}
     for r in rows:
         if r.get("pace") is not None:
             entry[r["model"]] = r["pace"]
-    station_snaps = _memory_snapshots.setdefault(station, {})
-    station_snaps.setdefault(date_str, []).append(entry)
+    if date_str not in _memory_snapshots:
+        _memory_snapshots[date_str] = []
+    _memory_snapshots[date_str].append(entry)
     avg = {}
     for r in rows:
         m = r["model"]
-        vals = [s[m] for s in station_snaps[date_str] if m in s]
+        vals = [s[m] for s in _memory_snapshots[date_str] if m in s]
         if vals:
             avg[m] = round(sum(vals)/len(vals), 2)
     st["today_avg_pace"] = avg
@@ -381,7 +361,7 @@ def save_pacing_snapshot(rows, station="KPHL"):
     add_log(f"Snapshot: {len([r for r in rows if r.get('pace') is not None])} models saved", "info", station)
 
 def rollup_daily_history(station="KPHL"):
-    now = local_now(station)
+    now = local_now()
     yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
     snapshots = load_json_file(f"{DATA_DIR}/pacing_{station}.json", {})
     if yesterday not in snapshots or not snapshots[yesterday]:
@@ -420,7 +400,7 @@ def build_snapshot_rows(station="KPHL"):
 
 def save_consensus_snapshot(station="KPHL"):
     st = get_state(station)
-    now = local_now(station)
+    now = local_now()
     if (now.hour < 9 or (now.hour == 9 and now.minute < 30)) or now.hour >= 23:
         return
     date_str = now.strftime("%Y-%m-%d")
@@ -491,16 +471,14 @@ def save_consensus_snapshot(station="KPHL"):
         add_log(f"Consensus snapshot error: {e}", "warn", station)
 
 def scheduled_fetch():
-    """Auto-fetch background stations only. Sequential with sleep gaps."""
-    for i, station in enumerate(BACKGROUND_STATIONS):
+    for i, station in enumerate(STATIONS):
         if i > 0:
-            gap = 10 + random.uniform(2, 5)
-            add_log(f"Waiting {gap:.0f}s before next station", "info", BACKGROUND_STATIONS[i-1])
-            time.sleep(gap)
-        try:
-            fetch_all(station)
-        except Exception as e:
-            add_log(f"scheduled_fetch error: {e}", "err", station)
+            time.sleep(30)
+        t = threading.Thread(target=fetch_all, args=(station,), daemon=True)
+        t.start()
+        t.join(timeout=120)
+        if t.is_alive():
+            add_log("Fetch timed out", "err", station)
 
 def background_loop():
     while True:
@@ -509,8 +487,9 @@ def background_loop():
         except Exception as e:
             print(f"Loop error: {e}")
         try:
-            for station in STATIONS:
-                if local_now(station).hour == 1:
+            now = local_now()
+            if now.hour == 1:
+                for station in STATIONS:
                     rollup_daily_history(station)
         except Exception as e:
             print(f"Rollup error: {e}")
@@ -530,7 +509,7 @@ def api_state():
     acc = st["accuracy"]
     models = active_models(station)
     rows = []
-    window_start, window_end = get_low_window(station)
+    window_start, window_end = get_low_window()
     for i, model in enumerate(models):
         a = acc.get(model, {})
         fcst = st["forecasts"].get(model, {})
@@ -590,9 +569,8 @@ def api_state():
                 w = 1/mae; pw_sum += float(pace)*w; pw_total += w
         except: pass
     consensus_pace = round(pw_sum/pw_total, 2) if pw_total > 0 else None
-    offset = STATION_TZ_OFFSET.get(station, -5)
-    ws_local = window_start + timedelta(hours=offset)
-    we_local = window_end + timedelta(hours=offset)
+    ws_local = window_start - timedelta(hours=5)
+    we_local = window_end - timedelta(hours=5)
     window_label = f"{ws_local.strftime('%a %-I%p')} – {we_local.strftime('%a %-I%p')}"
     return jsonify({
         "station": station, "obs": st["obs"], "wethr_low": st["wethr_low"],
@@ -601,7 +579,7 @@ def api_state():
         "log": st["log"][:30], "models": active_models(station),
         "consensus_pace": consensus_pace,
         "today_avg_pace": st["today_avg_pace"],
-        "today_snapshot_count": len(load_json_file(f"{DATA_DIR}/pacing_{station}.json", {}).get(local_now(station).strftime("%Y-%m-%d"), [])),
+        "today_snapshot_count": len(load_json_file(f"{DATA_DIR}/pacing_{station}.json", {}).get(local_now().strftime("%Y-%m-%d"), [])),
         "prev_days": _get_prev_days(3, station),
         "window_label": window_label,
     })
@@ -777,9 +755,6 @@ input[type=number]:focus{border-color:var(--ice)}
 .logbox{background:#060a0e;border-radius:4px;padding:12px;max-height:400px;overflow-y:auto}
 .pill-y{background:#facc1522;color:var(--yellow);border-radius:3px;padding:2px 7px;font-size:10px;font-weight:600}
 .pill-g{background:#4ade8022;color:var(--green);border-radius:3px;padding:2px 7px;font-size:10px;font-weight:600}
-.stn-btn{border-radius:4px;padding:5px 12px;font-size:11px;cursor:pointer;font-family:inherit;letter-spacing:1px;transition:all .15s}
-.stn-btn.active{background:#1e40af;border:1px solid #3b82f6;color:#93c5fd}
-.stn-btn.inactive{background:none;border:1px solid #334155;color:#64748b}
 .window-badge{background:#a5f3fc22;color:var(--ice);border-radius:3px;padding:2px 8px;font-size:10px;font-weight:600;letter-spacing:1px}
 /* Default run column highlight */
 .default-col{background:#fb923c0d !important}
@@ -816,7 +791,11 @@ th.default-col{color:var(--orange) !important}
       <div style="font-size:11px;font-weight:600;color:var(--ice);margin-top:4px" id="h-window">--</div>
     </div>
     <div class="sp"></div>
-    <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap" id="station-btns"></div>
+    <div style="display:flex;gap:6px;align-items:center">
+      <button id="btn-KPHL" onclick="switchStation('KPHL')" style="background:#1e40af;border:1px solid #3b82f6;color:#93c5fd;border-radius:4px;padding:5px 12px;font-size:11px;cursor:pointer;font-family:inherit;letter-spacing:1px">KPHL</button>
+      <button id="btn-KATL" onclick="switchStation('KATL')" style="background:none;border:1px solid #334155;color:#64748b;border-radius:4px;padding:5px 12px;font-size:11px;cursor:pointer;font-family:inherit;letter-spacing:1px">KATL</button>
+      <button id="btn-KOKC" onclick="switchStation('KOKC')" style="background:none;border:1px solid #334155;color:#64748b;border-radius:4px;padding:5px 12px;font-size:11px;cursor:pointer;font-family:inherit;letter-spacing:1px">KOKC</button>
+    </div>
     <div class="sp"></div>
     <div style="text-align:right">
       <div style="display:flex;align-items:center;gap:6px;font-size:10px;color:var(--dim)">
@@ -1073,47 +1052,13 @@ th.default-col{color:var(--orange) !important}
 </main>
 
 <script>
-var STATION_LIST = ["KPHL","KATL","KOKC","KDCA","KBOS","KDEN","KHOU","KLAS","KMDW","KMSP"];
-var STATION_NAMES_JS = {
-  "KPHL":"Philadelphia International Airport",
-  "KATL":"Atlanta Hartsfield-Jackson Airport",
-  "KOKC":"Oklahoma City Will Rogers World Airport",
-  "KDCA":"Washington Reagan National Airport",
-  "KBOS":"Boston Logan International Airport",
-  "KDEN":"Denver International Airport",
-  "KHOU":"Houston William P. Hobby Airport",
-  "KLAS":"Las Vegas Harry Reid International Airport",
-  "KMDW":"Chicago Midway International Airport",
-  "KMSP":"Minneapolis-Saint Paul International Airport"
-};
 var STATION = localStorage.getItem("active_station_lows") || "KPHL";
-if(STATION_LIST.indexOf(STATION) === -1) STATION = "KPHL";
 var MODELS = [];
 var accData = {};
 try { accData = JSON.parse(localStorage.getItem("acc_lows_"+STATION) || "{}"); } catch(e){}
 if(Object.keys(accData).length) MODELS = Object.keys(accData).filter(function(m){ return m !== "NWS"; });
 var countdown = 1200;
 var countdownTimer;
-
-(function(){
-  var container = document.getElementById("station-btns");
-  STATION_LIST.forEach(function(s){
-    var btn = document.createElement("button");
-    btn.id = "btn-"+s;
-    btn.textContent = s;
-    btn.className = "stn-btn " + (s === STATION ? "active" : "inactive");
-    btn.onclick = function(){ switchStation(s); };
-    container.appendChild(btn);
-  });
-})();
-
-function updateStationButtons(){
-  STATION_LIST.forEach(function(s){
-    var btn = document.getElementById("btn-"+s);
-    if(!btn) return;
-    btn.className = "stn-btn " + (s === STATION ? "active" : "inactive");
-  });
-}
 
 function clearDisplay(){
   ["h-obs","h-wl","h-con","s-obs","s-wl","s-con"].forEach(function(id){
@@ -1134,8 +1079,16 @@ function switchStation(s){
   clearDisplay();
   try { accData = JSON.parse(localStorage.getItem("acc_lows_"+s) || "{}"); } catch(e){ accData = {}; }
   MODELS = Object.keys(accData).filter(function(m){ return m !== "NWS"; });
-  updateStationButtons();
-  document.getElementById("h-sub").textContent = STATION_NAMES_JS[s] || s;
+  ["KPHL","KATL","KOKC"].forEach(function(st){
+    var btn = document.getElementById("btn-"+st);
+    if(st === s){
+      btn.style.background="#1e40af"; btn.style.borderColor="#3b82f6"; btn.style.color="#93c5fd";
+    } else {
+      btn.style.background="none"; btn.style.borderColor="#334155"; btn.style.color="#64748b";
+    }
+  });
+  var names = {"KPHL":"Philadelphia International Airport","KATL":"Atlanta Hartsfield-Jackson Airport","KOKC":"Oklahoma City Will Rogers World Airport"};
+  document.getElementById("h-sub").textContent = names[s] || s;
   buildForms(); buildDefaultForm(); renderPreview(); poll();
 }
 
