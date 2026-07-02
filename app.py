@@ -169,9 +169,7 @@ def wethr_get(path):
     r = requests.get(
         f"https://wethr.net/api/v2/{path}",
         headers={"X-API-Key": API_KEY},
-        timeout=(3.05, 6)  # (connect timeout, read timeout) - explicit tuple so a
-                            # hung DNS lookup / connect phase can't bypass the limit
-                            # the way a single float timeout sometimes can
+        timeout=6
     )
     r.raise_for_status()
     return r.json()
@@ -189,24 +187,27 @@ def parse_vt(x):
     try: return datetime.strptime(vt[:16], "%Y-%m-%d %H:%M")
     except: return None
 
-def local_now(station="KPHL"):
+def station_local_now(station="KPHL"):
     offset = STATION_TZ_OFFSET.get(station, -5)
     return datetime.utcnow() + timedelta(hours=offset)
 
+def local_now():
+    return station_local_now("KPHL")
+
 def get_low_window(station="KPHL"):
-    offset = STATION_TZ_OFFSET.get(station, -5)
-    now_local = local_now(station)
+    tz_offset = STATION_TZ_OFFSET.get(station, -5)
+    now_local = station_local_now(station)
     if now_local.hour > 9 or (now_local.hour == 9 and now_local.minute >= 30):
         tomorrow = now_local.replace(hour=1, minute=0, second=0, microsecond=0) + timedelta(days=1)
-        window_start_utc = tomorrow - timedelta(hours=offset)
+        window_start_utc = tomorrow + timedelta(hours=abs(tz_offset))
         window_end_utc = window_start_utc + timedelta(hours=24)
     else:
         today_1am = now_local.replace(hour=1, minute=0, second=0, microsecond=0)
-        window_start_utc = today_1am - timedelta(hours=offset)
+        window_start_utc = today_1am + timedelta(hours=abs(tz_offset))
         window_end_utc = window_start_utc + timedelta(hours=24)
     return window_start_utc, window_end_utc
 
-def low_window_entries(temps, station="KPHL"):
+def low_window_entries(temps):
     window_start, window_end = get_low_window(station)
     filtered = [x for x in temps if parse_vt(x) is not None and window_start <= parse_vt(x) < window_end]
     return filtered
@@ -282,7 +283,7 @@ def fetch_all(station="KPHL"):
         return
 
     utc_now = datetime.utcnow()
-    window_start, window_end = get_low_window(station)
+    window_start, window_end = get_low_window()
 
     for model in fetch_targets:
         try:
@@ -311,8 +312,8 @@ def fetch_all(station="KPHL"):
                 vt = parse_vt(min_entry)
                 low_time = None
                 if vt:
-                    offset = STATION_TZ_OFFSET.get(station, -5)
-                    local_vt = vt + timedelta(hours=offset)
+                    tz_offset = STATION_TZ_OFFSET.get(station, -5)
+                    local_vt = vt + timedelta(hours=tz_offset)
                     low_time = local_vt.strftime("%-I:%M%p").lower()
 
                 st["forecasts"][model] = {
@@ -341,29 +342,30 @@ def fetch_all(station="KPHL"):
         add_log(f"Snapshot error: {e}", "warn", station)
 
     try:
-        now_local = local_now(station)
+        now_local = station_local_now(station)
         if now_local.minute < 20 or (now_local.minute >= 30 and now_local.minute < 50):
             save_consensus_snapshot(station)
     except Exception as e:
         add_log(f"Consensus snapshot error: {e}", "warn", station)
 
-_memory_snapshots = {}  # {station: {date_str: [entries]}}
+_memory_snapshots = {}
 
 def save_pacing_snapshot(rows, station="KPHL"):
     st = get_state(station)
-    now = local_now(station)
+    now = station_local_now(station)
     date_str = now.strftime("%Y-%m-%d")
     time_str = now.strftime("%H:%M")
     entry = {"time": time_str}
     for r in rows:
         if r.get("pace") is not None:
             entry[r["model"]] = r["pace"]
-    station_snaps = _memory_snapshots.setdefault(station, {})
-    station_snaps.setdefault(date_str, []).append(entry)
+    if date_str not in _memory_snapshots:
+        _memory_snapshots[date_str] = []
+    _memory_snapshots[date_str].append(entry)
     avg = {}
     for r in rows:
         m = r["model"]
-        vals = [s[m] for s in station_snaps[date_str] if m in s]
+        vals = [s[m] for s in _memory_snapshots[date_str] if m in s]
         if vals:
             avg[m] = round(sum(vals)/len(vals), 2)
     st["today_avg_pace"] = avg
@@ -383,7 +385,7 @@ def save_pacing_snapshot(rows, station="KPHL"):
     add_log(f"Snapshot: {len([r for r in rows if r.get('pace') is not None])} models saved", "info", station)
 
 def rollup_daily_history(station="KPHL"):
-    now = local_now(station)
+    now = station_local_now(station)
     yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
     snapshots = load_json_file(f"{DATA_DIR}/pacing_{station}.json", {})
     if yesterday not in snapshots or not snapshots[yesterday]:
@@ -422,7 +424,7 @@ def build_snapshot_rows(station="KPHL"):
 
 def save_consensus_snapshot(station="KPHL"):
     st = get_state(station)
-    now = local_now(station)
+    now = station_local_now(station)
     if (now.hour < 9 or (now.hour == 9 and now.minute < 30)) or now.hour >= 23:
         return
     date_str = now.strftime("%Y-%m-%d")
@@ -511,8 +513,9 @@ def background_loop():
         except Exception as e:
             print(f"Loop error: {e}")
         try:
-            for station in STATIONS:
-                if local_now(station).hour == 1:
+            now = station_local_now("KPHL")
+            if now.hour == 1:
+                for station in STATIONS:
                     rollup_daily_history(station)
         except Exception as e:
             print(f"Rollup error: {e}")
@@ -532,7 +535,7 @@ def api_state():
     acc = st["accuracy"]
     models = active_models(station)
     rows = []
-    window_start, window_end = get_low_window(station)
+    window_start, window_end = get_low_window()
     for i, model in enumerate(models):
         a = acc.get(model, {})
         fcst = st["forecasts"].get(model, {})
@@ -592,9 +595,9 @@ def api_state():
                 w = 1/mae; pw_sum += float(pace)*w; pw_total += w
         except: pass
     consensus_pace = round(pw_sum/pw_total, 2) if pw_total > 0 else None
-    offset = STATION_TZ_OFFSET.get(station, -5)
-    ws_local = window_start + timedelta(hours=offset)
-    we_local = window_end + timedelta(hours=offset)
+    _tz = STATION_TZ_OFFSET.get(station, -5)
+    ws_local = window_start + timedelta(hours=_tz)
+    we_local = window_end + timedelta(hours=_tz)
     window_label = f"{ws_local.strftime('%a %-I%p')} – {we_local.strftime('%a %-I%p')}"
     return jsonify({
         "station": station, "obs": st["obs"], "wethr_low": st["wethr_low"],
@@ -603,7 +606,7 @@ def api_state():
         "log": st["log"][:30], "models": active_models(station),
         "consensus_pace": consensus_pace,
         "today_avg_pace": st["today_avg_pace"],
-        "today_snapshot_count": len(load_json_file(f"{DATA_DIR}/pacing_{station}.json", {}).get(local_now(station).strftime("%Y-%m-%d"), [])),
+        "today_snapshot_count": len(load_json_file(f"{DATA_DIR}/pacing_{station}.json", {}).get(station_local_now(station).strftime("%Y-%m-%d"), [])),
         "prev_days": _get_prev_days(3, station),
         "window_label": window_label,
     })
@@ -712,6 +715,23 @@ def get_verification():
         station = "KPHL"
     verif = load_json_file(f"{DATA_DIR}/verification_{station}.json", {})
     return jsonify(verif)
+
+@app.before_request
+def watchdog():
+    for t in threading.enumerate():
+        if t.name == "bgloop":
+            return
+    print("WATCHDOG: restarting background thread", flush=True)
+    t = threading.Thread(target=background_loop, daemon=True, name="bgloop")
+    t.start()
+
+@app.route("/api/debug_threads")
+def debug_threads():
+    return jsonify({
+        "started_flag": _started,
+        "threads": [t.name for t in threading.enumerate()],
+        "pid": os.getpid(),
+    })
 
 @app.route("/")
 def index():
