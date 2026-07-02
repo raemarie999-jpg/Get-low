@@ -208,9 +208,21 @@ def get_temp(x):
     return None
 
 def parse_vt(x):
-    vt = str(x.get("valid_time",""))
-    try: return datetime.strptime(vt[:16], "%Y-%m-%d %H:%M")
-    except: return None
+    vt = str(x.get("valid_time", "")).strip()
+    if not vt:
+        return None
+    # Normalize common variants: ISO 'T' separator, trailing 'Z', trailing offset
+    candidate = vt.replace("T", " ").rstrip("Z").strip()
+    for length, fmt in ((19, "%Y-%m-%d %H:%M:%S"), (16, "%Y-%m-%d %H:%M")):
+        try:
+            return datetime.strptime(candidate[:length], fmt)
+        except (ValueError, TypeError):
+            continue
+    # Last resort: try fromisoformat, which tolerates offsets like +00:00
+    try:
+        return datetime.fromisoformat(vt.replace("Z", "+00:00")).replace(tzinfo=None)
+    except (ValueError, TypeError):
+        return None
 
 def local_now(station="KPHL"):
     offset = STATION_TZ_OFFSET.get(station, -5)
@@ -318,7 +330,9 @@ def fetch_all(station="KPHL"):
             if temps:
                 window = low_window_entries(temps, station)
                 if not window:
-                    add_log(f"{model}: no entries in low window", "warn", station)
+                    sample_vt = temps[0].get("valid_time") if temps else None
+                    parsed_ok = sum(1 for t in temps if parse_vt(t) is not None)
+                    add_log(f"{model}: no entries in low window (raw sample valid_time={sample_vt!r}, {parsed_ok}/{len(temps)} parsed)", "warn", station)
                     continue
                 min_entries = 12 if model == "HRRR" else 4
                 if len(window) < min_entries:
@@ -519,12 +533,11 @@ def save_consensus_snapshot(station="KPHL"):
         add_log(f"Consensus snapshot error: {e}", "warn", station)
 
 def scheduled_fetch():
-    """Auto-fetch background stations only. Sequential with sleep gaps."""
+    """Auto-fetch background stations only. Sequential with sleep gaps before each station."""
     for i, station in enumerate(BACKGROUND_STATIONS):
-        if i > 0:
-            gap = 10 + random.uniform(2, 5)
-            add_log(f"Waiting {gap:.0f}s before next station", "info", BACKGROUND_STATIONS[i-1])
-            time.sleep(gap)
+        gap = 10 + random.uniform(2, 5)
+        add_log(f"Waiting {gap:.0f}s before fetching {station}", "info", station)
+        time.sleep(gap)
         try:
             fetch_all(station)
         except Exception as e:
