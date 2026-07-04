@@ -1,4 +1,4 @@
-import os, json, time, threading
+import os, json, time, threading, random
 from datetime import datetime, timedelta
 from flask import Flask, jsonify, request, render_template_string
 import requests
@@ -32,16 +32,34 @@ def save_json_file(path, data):
         add_log(f"Save error {path}: {e}", "err")
         return False
 
-STATIONS = ["KPHL", "KATL", "KOKC"]
+STATIONS = ["KPHL","KATL","KOKC","KDCA","KBOS","KDEN","KHOU","KLAS","KMDW","KMSP"]
 STATION_NAMES = {
     "KPHL": "Philadelphia International Airport",
     "KATL": "Atlanta Hartsfield-Jackson Airport",
     "KOKC": "Oklahoma City Will Rogers World Airport",
+    "KDCA": "Washington Reagan National Airport",
+    "KBOS": "Boston Logan International Airport",
+    "KDEN": "Denver International Airport",
+    "KHOU": "Houston William P. Hobby Airport",
+    "KLAS": "Las Vegas Harry Reid International Airport",
+    "KMDW": "Chicago Midway International Airport",
+    "KMSP": "Minneapolis-Saint Paul International Airport",
 }
+STATION_TZ_OFFSET = {
+    "KPHL": -5, "KATL": -5, "KOKC": -6, "KDCA": -5, "KBOS": -5,
+    "KDEN": -7, "KHOU": -6, "KLAS": -8, "KMDW": -6, "KMSP": -6,
+}
+BACKGROUND_STATIONS = ["KPHL", "KATL", "KOKC"]
+STATION_LON = {
+    "KPHL": -75.2408, "KATL": -84.4277, "KOKC": -97.6007,
+    "KDCA": -77.0377, "KBOS": -71.0052, "KDEN": -104.6737,
+    "KHOU": -95.2789, "KLAS": -115.1523, "KMDW": -87.7524, "KMSP": -93.2218,
+}
+_SKY_COVER_MAP = {"CLR": 0, "SKC": 0, "FEW": 1, "SCT": 3, "BKN": 5, "OVC": 7, "OVX": 8}
 
 ALL_KNOWN_MODELS = [
     "ARPEGE","HRRR","UKMO","LAV-MOS","NAM","RAP","GEM-GDPS","NAM-MOS","NBM",
-    "NAM4KM","GFS","ICON","GFS-MOS","ECMWF-HRES","GEFS","JMA","RDPS","SREF"
+    "NAM4KM","GFS","ICON","GFS-MOS","NBS-MOS","ECMWF-HRES","GEFS","JMA","RDPS","SREF"
 ]
 REFRESH_SEC = 1800
 
@@ -145,16 +163,41 @@ def _throttle():
             time.sleep(wait)
         _last_request_time = time.monotonic()
 
-def wethr_get(path):
+def wethr_get(path, retries=3):
+    """
+    Rate-limited GET with exponential backoff retry on 429/5xx/connection errors.
+    Raises DailyCapExceeded immediately if the hard daily cap is reached.
+    Ported from the high-temp app's proven-working implementation.
+    """
     _check_and_increment()  # raises DailyCapExceeded before any sleep/request
-    _throttle()
-    r = requests.get(
-        f"https://wethr.net/api/v2/{path}",
-        headers={"X-API-Key": API_KEY},
-        timeout=6
-    )
-    r.raise_for_status()
-    return r.json()
+    for attempt in range(retries):
+        _throttle()
+        try:
+            r = requests.get(
+                f"https://wethr.net/api/v2/{path}",
+                headers={"X-API-Key": API_KEY},
+                timeout=10
+            )
+            if r.status_code == 429:
+                wait = (2 ** attempt) * 5 + random.uniform(1, 3)
+                print(f"[429] Rate limited on {path}. Waiting {wait:.1f}s (attempt {attempt+1}/{retries})")
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            return r.json()
+        except requests.exceptions.HTTPError as e:
+            if attempt < retries - 1 and e.response is not None and e.response.status_code in (429, 500, 502, 503):
+                wait = (2 ** attempt) * 5 + random.uniform(1, 3)
+                print(f"[{e.response.status_code}] Retrying {path} in {wait:.1f}s")
+                time.sleep(wait)
+                continue
+            raise
+        except requests.exceptions.RequestException:
+            if attempt < retries - 1:
+                time.sleep(3 * (attempt + 1))
+                continue
+            raise
+    raise RuntimeError(f"Failed after {retries} attempts: {path}")
 
 def get_temp(x):
     for k in ["temperature_f","temperature_display","temperature","temp","value","low"]:
@@ -165,29 +208,41 @@ def get_temp(x):
     return None
 
 def parse_vt(x):
-    vt = str(x.get("valid_time",""))
-    try: return datetime.strptime(vt[:16], "%Y-%m-%d %H:%M")
-    except: return None
+    vt = str(x.get("valid_time", "")).strip()
+    if not vt:
+        return None
+    # Normalize common variants: ISO 'T' separator, trailing 'Z', trailing offset
+    candidate = vt.replace("T", " ").rstrip("Z").strip()
+    for length, fmt in ((19, "%Y-%m-%d %H:%M:%S"), (16, "%Y-%m-%d %H:%M")):
+        try:
+            return datetime.strptime(candidate[:length], fmt)
+        except (ValueError, TypeError):
+            continue
+    # Last resort: try fromisoformat, which tolerates offsets like +00:00
+    try:
+        return datetime.fromisoformat(vt.replace("Z", "+00:00")).replace(tzinfo=None)
+    except (ValueError, TypeError):
+        return None
 
-def local_now():
-    return datetime.utcnow() - timedelta(hours=5)
+def local_now(station="KPHL"):
+    offset = STATION_TZ_OFFSET.get(station, -5)
+    return datetime.utcnow() + timedelta(hours=offset)
 
-def get_low_window():
-    now_local = local_now()
+def get_low_window(station="KPHL"):
+    offset = STATION_TZ_OFFSET.get(station, -5)
+    now_local = local_now(station)
     if now_local.hour > 9 or (now_local.hour == 9 and now_local.minute >= 30):
-        # After 9:30am EST: target tomorrow 1AM -> day after 1AM
         tomorrow = now_local.replace(hour=1, minute=0, second=0, microsecond=0) + timedelta(days=1)
-        window_start_utc = tomorrow + timedelta(hours=5)
+        window_start_utc = tomorrow - timedelta(hours=offset)
         window_end_utc = window_start_utc + timedelta(hours=24)
     else:
-        # Before 9:30am EST: target yesterday 1AM -> today 1AM
         today_1am = now_local.replace(hour=1, minute=0, second=0, microsecond=0)
-        window_start_utc = today_1am + timedelta(hours=5)
+        window_start_utc = today_1am - timedelta(hours=offset)
         window_end_utc = window_start_utc + timedelta(hours=24)
     return window_start_utc, window_end_utc
 
-def low_window_entries(temps):
-    window_start, window_end = get_low_window()
+def low_window_entries(temps, station="KPHL"):
+    window_start, window_end = get_low_window(station)
     filtered = [x for x in temps if parse_vt(x) is not None and window_start <= parse_vt(x) < window_end]
     return filtered
 
@@ -223,12 +278,15 @@ def fetch_all(station="KPHL"):
         add_log("No API key set", "err", station)
         return
     # Check cap before doing anything
-    counter_data = _load_api_counter()
-    period = _get_period_key()
-    current_count = counter_data.get(period, 0)
-    if current_count >= DAILY_REQUEST_CAP:
-        add_log(f"Daily API cap reached ({current_count}/{DAILY_REQUEST_CAP}) — skipping fetch. Resets 3:30pm EST.", "warn", station)
-        return
+    try:
+        counter_data = _load_api_counter()
+        period = _get_period_key()
+        current_count = counter_data.get(period, 0)
+        if current_count >= DAILY_REQUEST_CAP:
+            add_log(f"Daily API cap reached ({current_count}/{DAILY_REQUEST_CAP}) — skipping fetch. Resets 3:30pm EST.", "warn", station)
+            return
+    except Exception:
+        pass
     add_log("Fetching data...", "info", station)
     errors = []
 
@@ -262,7 +320,7 @@ def fetch_all(station="KPHL"):
         return
 
     utc_now = datetime.utcnow()
-    window_start, window_end = get_low_window()
+    window_start, window_end = get_low_window(station)
 
     for model in fetch_targets:
         try:
@@ -270,9 +328,15 @@ def fetch_all(station="KPHL"):
             temps = data if isinstance(data, list) else data.get("forecasts", [])
             meta = {} if isinstance(data, list) else data
             if temps:
-                window = low_window_entries(temps)
+                window = low_window_entries(temps, station)
                 if not window:
-                    add_log(f"{model}: no entries in low window", "warn", station)
+                    sample_vt = temps[0].get("valid_time") if temps else None
+                    parsed_ok = sum(1 for t in temps if parse_vt(t) is not None)
+                    add_log(f"{model}: no entries in low window (raw sample valid_time={sample_vt!r}, {parsed_ok}/{len(temps)} parsed)", "warn", station)
+                    continue
+                min_entries = 12 if model == "HRRR" else 4
+                if len(window) < min_entries:
+                    add_log(f"{model}: only {len(window)} entries in window — run not fully ingested yet, keeping previous", "warn", station)
                     continue
                 min_entry = min(window, key=lambda x: get_temp(x) or 999)
                 raw_temp = get_temp(min_entry)
@@ -287,7 +351,8 @@ def fetch_all(station="KPHL"):
                 vt = parse_vt(min_entry)
                 low_time = None
                 if vt:
-                    local_vt = vt - timedelta(hours=5)
+                    offset = STATION_TZ_OFFSET.get(station, -5)
+                    local_vt = vt + timedelta(hours=offset)
                     low_time = local_vt.strftime("%-I:%M%p").lower()
 
                 st["forecasts"][model] = {
@@ -316,30 +381,29 @@ def fetch_all(station="KPHL"):
         add_log(f"Snapshot error: {e}", "warn", station)
 
     try:
-        now_local = local_now()
+        now_local = local_now(station)
         if now_local.minute < 20 or (now_local.minute >= 30 and now_local.minute < 50):
             save_consensus_snapshot(station)
     except Exception as e:
         add_log(f"Consensus snapshot error: {e}", "warn", station)
 
-_memory_snapshots = {}
+_memory_snapshots = {}  # {station: {date_str: [entries]}}
 
 def save_pacing_snapshot(rows, station="KPHL"):
     st = get_state(station)
-    now = local_now()
+    now = local_now(station)
     date_str = now.strftime("%Y-%m-%d")
     time_str = now.strftime("%H:%M")
     entry = {"time": time_str}
     for r in rows:
         if r.get("pace") is not None:
             entry[r["model"]] = r["pace"]
-    if date_str not in _memory_snapshots:
-        _memory_snapshots[date_str] = []
-    _memory_snapshots[date_str].append(entry)
+    station_snaps = _memory_snapshots.setdefault(station, {})
+    station_snaps.setdefault(date_str, []).append(entry)
     avg = {}
     for r in rows:
         m = r["model"]
-        vals = [s[m] for s in _memory_snapshots[date_str] if m in s]
+        vals = [s[m] for s in station_snaps[date_str] if m in s]
         if vals:
             avg[m] = round(sum(vals)/len(vals), 2)
     st["today_avg_pace"] = avg
@@ -359,7 +423,7 @@ def save_pacing_snapshot(rows, station="KPHL"):
     add_log(f"Snapshot: {len([r for r in rows if r.get('pace') is not None])} models saved", "info", station)
 
 def rollup_daily_history(station="KPHL"):
-    now = local_now()
+    now = local_now(station)
     yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
     snapshots = load_json_file(f"{DATA_DIR}/pacing_{station}.json", {})
     if yesterday not in snapshots or not snapshots[yesterday]:
@@ -398,7 +462,7 @@ def build_snapshot_rows(station="KPHL"):
 
 def save_consensus_snapshot(station="KPHL"):
     st = get_state(station)
-    now = local_now()
+    now = local_now(station)
     if (now.hour < 9 or (now.hour == 9 and now.minute < 30)) or now.hour >= 23:
         return
     date_str = now.strftime("%Y-%m-%d")
@@ -469,14 +533,15 @@ def save_consensus_snapshot(station="KPHL"):
         add_log(f"Consensus snapshot error: {e}", "warn", station)
 
 def scheduled_fetch():
-    for i, station in enumerate(STATIONS):
-        if i > 0:
-            time.sleep(30)
-        t = threading.Thread(target=fetch_all, args=(station,), daemon=True)
-        t.start()
-        t.join(timeout=120)
-        if t.is_alive():
-            add_log("Fetch timed out", "err", station)
+    """Auto-fetch background stations only. Sequential with sleep gaps before each station."""
+    for i, station in enumerate(BACKGROUND_STATIONS):
+        gap = 10 + random.uniform(2, 5)
+        add_log(f"Waiting {gap:.0f}s before fetching {station}", "info", station)
+        time.sleep(gap)
+        try:
+            fetch_all(station)
+        except Exception as e:
+            add_log(f"scheduled_fetch error: {e}", "err", station)
 
 def background_loop():
     while True:
@@ -485,9 +550,8 @@ def background_loop():
         except Exception as e:
             print(f"Loop error: {e}")
         try:
-            now = local_now()
-            if now.hour == 1:
-                for station in STATIONS:
+            for station in STATIONS:
+                if local_now(station).hour == 1:
                     rollup_daily_history(station)
         except Exception as e:
             print(f"Rollup error: {e}")
@@ -507,7 +571,7 @@ def api_state():
     acc = st["accuracy"]
     models = active_models(station)
     rows = []
-    window_start, window_end = get_low_window()
+    window_start, window_end = get_low_window(station)
     for i, model in enumerate(models):
         a = acc.get(model, {})
         fcst = st["forecasts"].get(model, {})
@@ -567,8 +631,9 @@ def api_state():
                 w = 1/mae; pw_sum += float(pace)*w; pw_total += w
         except: pass
     consensus_pace = round(pw_sum/pw_total, 2) if pw_total > 0 else None
-    ws_local = window_start - timedelta(hours=5)
-    we_local = window_end - timedelta(hours=5)
+    offset = STATION_TZ_OFFSET.get(station, -5)
+    ws_local = window_start + timedelta(hours=offset)
+    we_local = window_end + timedelta(hours=offset)
     window_label = f"{ws_local.strftime('%a %-I%p')} – {we_local.strftime('%a %-I%p')}"
     return jsonify({
         "station": station, "obs": st["obs"], "wethr_low": st["wethr_low"],
@@ -577,7 +642,7 @@ def api_state():
         "log": st["log"][:30], "models": active_models(station),
         "consensus_pace": consensus_pace,
         "today_avg_pace": st["today_avg_pace"],
-        "today_snapshot_count": len(load_json_file(f"{DATA_DIR}/pacing_{station}.json", {}).get(local_now().strftime("%Y-%m-%d"), [])),
+        "today_snapshot_count": len(load_json_file(f"{DATA_DIR}/pacing_{station}.json", {}).get(local_now(station).strftime("%Y-%m-%d"), [])),
         "prev_days": _get_prev_days(3, station),
         "window_label": window_label,
     })
@@ -753,6 +818,9 @@ input[type=number]:focus{border-color:var(--ice)}
 .logbox{background:#060a0e;border-radius:4px;padding:12px;max-height:400px;overflow-y:auto}
 .pill-y{background:#facc1522;color:var(--yellow);border-radius:3px;padding:2px 7px;font-size:10px;font-weight:600}
 .pill-g{background:#4ade8022;color:var(--green);border-radius:3px;padding:2px 7px;font-size:10px;font-weight:600}
+.stn-btn{border-radius:4px;padding:5px 12px;font-size:11px;cursor:pointer;font-family:inherit;letter-spacing:1px;transition:all .15s}
+.stn-btn.active{background:#1e40af;border:1px solid #3b82f6;color:#93c5fd}
+.stn-btn.inactive{background:none;border:1px solid #334155;color:#64748b}
 .window-badge{background:#a5f3fc22;color:var(--ice);border-radius:3px;padding:2px 8px;font-size:10px;font-weight:600;letter-spacing:1px}
 /* Default run column highlight */
 .default-col{background:#fb923c0d !important}
@@ -789,11 +857,7 @@ th.default-col{color:var(--orange) !important}
       <div style="font-size:11px;font-weight:600;color:var(--ice);margin-top:4px" id="h-window">--</div>
     </div>
     <div class="sp"></div>
-    <div style="display:flex;gap:6px;align-items:center">
-      <button id="btn-KPHL" onclick="switchStation('KPHL')" style="background:#1e40af;border:1px solid #3b82f6;color:#93c5fd;border-radius:4px;padding:5px 12px;font-size:11px;cursor:pointer;font-family:inherit;letter-spacing:1px">KPHL</button>
-      <button id="btn-KATL" onclick="switchStation('KATL')" style="background:none;border:1px solid #334155;color:#64748b;border-radius:4px;padding:5px 12px;font-size:11px;cursor:pointer;font-family:inherit;letter-spacing:1px">KATL</button>
-      <button id="btn-KOKC" onclick="switchStation('KOKC')" style="background:none;border:1px solid #334155;color:#64748b;border-radius:4px;padding:5px 12px;font-size:11px;cursor:pointer;font-family:inherit;letter-spacing:1px">KOKC</button>
-    </div>
+    <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap" id="station-btns"></div>
     <div class="sp"></div>
     <div style="text-align:right">
       <div style="display:flex;align-items:center;gap:6px;font-size:10px;color:var(--dim)">
@@ -894,6 +958,16 @@ th.default-col{color:var(--orange) !important}
       has <em>no</em> run-specific entry — keeping it out of consensus rather than polluting it with uncalibrated data.
       <br><span style="color:var(--orange)">D</span> badge in the dashboard Correction column indicates the default is active.
     </p>
+    <div style="margin-bottom:14px;padding:10px;background:#1a1a2e;border:1px solid #334155;border-radius:6px">
+      <div style="font-size:10px;color:var(--orange);letter-spacing:1px;margin-bottom:6px">&#9657; PASTE FROM WETHR.NET</div>
+      <div style="font-size:11px;color:var(--dim);margin-bottom:8px">Paste the accuracy table from wethr.net — all models auto-filled in one shot.</div>
+      <textarea id="paste-defaults-input" rows="6" style="width:100%;background:#0f0f1a;border:1px solid #334155;color:var(--text);border-radius:4px;padding:8px;font-size:11px;font-family:monospace;box-sizing:border-box;resize:vertical" placeholder="MODEL&#9;MAE&#9;CORRECTION&#9;RMSE&#9;DAYS&#10;NBM&#9;0.7°&#9;-0.5°F&#9;1.1°&#9;6&#10;HRRR&#9;1.1°&#9;+0.1°F&#9;1.5°&#9;6&#10;..."></textarea>
+      <div style="display:flex;gap:8px;margin-top:8px;align-items:center;flex-wrap:wrap">
+        <button class="btn" onclick="parseAndFillDefaults()">Fill From Paste</button>
+        <button class="btn" onclick="fillDefaultsFromLoaded()">Fill From Loaded Accuracy</button>
+        <span id="paste-status" style="font-size:10px;color:var(--dim)"></span>
+      </div>
+    </div>
     <div style="overflow-x:auto">
       <table>
         <thead>
@@ -1040,13 +1114,47 @@ th.default-col{color:var(--orange) !important}
 </main>
 
 <script>
+var STATION_LIST = ["KPHL","KATL","KOKC","KDCA","KBOS","KDEN","KHOU","KLAS","KMDW","KMSP"];
+var STATION_NAMES_JS = {
+  "KPHL":"Philadelphia International Airport",
+  "KATL":"Atlanta Hartsfield-Jackson Airport",
+  "KOKC":"Oklahoma City Will Rogers World Airport",
+  "KDCA":"Washington Reagan National Airport",
+  "KBOS":"Boston Logan International Airport",
+  "KDEN":"Denver International Airport",
+  "KHOU":"Houston William P. Hobby Airport",
+  "KLAS":"Las Vegas Harry Reid International Airport",
+  "KMDW":"Chicago Midway International Airport",
+  "KMSP":"Minneapolis-Saint Paul International Airport"
+};
 var STATION = localStorage.getItem("active_station_lows") || "KPHL";
+if(STATION_LIST.indexOf(STATION) === -1) STATION = "KPHL";
 var MODELS = [];
 var accData = {};
 try { accData = JSON.parse(localStorage.getItem("acc_lows_"+STATION) || "{}"); } catch(e){}
 if(Object.keys(accData).length) MODELS = Object.keys(accData).filter(function(m){ return m !== "NWS"; });
 var countdown = 1200;
 var countdownTimer;
+
+(function(){
+  var container = document.getElementById("station-btns");
+  STATION_LIST.forEach(function(s){
+    var btn = document.createElement("button");
+    btn.id = "btn-"+s;
+    btn.textContent = s;
+    btn.className = "stn-btn " + (s === STATION ? "active" : "inactive");
+    btn.onclick = function(){ switchStation(s); };
+    container.appendChild(btn);
+  });
+})();
+
+function updateStationButtons(){
+  STATION_LIST.forEach(function(s){
+    var btn = document.getElementById("btn-"+s);
+    if(!btn) return;
+    btn.className = "stn-btn " + (s === STATION ? "active" : "inactive");
+  });
+}
 
 function clearDisplay(){
   ["h-obs","h-wl","h-con","s-obs","s-wl","s-con"].forEach(function(id){
@@ -1067,16 +1175,8 @@ function switchStation(s){
   clearDisplay();
   try { accData = JSON.parse(localStorage.getItem("acc_lows_"+s) || "{}"); } catch(e){ accData = {}; }
   MODELS = Object.keys(accData).filter(function(m){ return m !== "NWS"; });
-  ["KPHL","KATL","KOKC"].forEach(function(st){
-    var btn = document.getElementById("btn-"+st);
-    if(st === s){
-      btn.style.background="#1e40af"; btn.style.borderColor="#3b82f6"; btn.style.color="#93c5fd";
-    } else {
-      btn.style.background="none"; btn.style.borderColor="#334155"; btn.style.color="#64748b";
-    }
-  });
-  var names = {"KPHL":"Philadelphia International Airport","KATL":"Atlanta Hartsfield-Jackson Airport","KOKC":"Oklahoma City Will Rogers World Airport"};
-  document.getElementById("h-sub").textContent = names[s] || s;
+  updateStationButtons();
+  document.getElementById("h-sub").textContent = STATION_NAMES_JS[s] || s;
   buildForms(); buildDefaultForm(); renderPreview(); poll();
 }
 
@@ -1149,6 +1249,65 @@ function buildDefaultForm(){
       +'<td style="color:var(--dim);font-size:11px">'+namedRuns+'</td>'
       +'</tr>';
   }).join("");
+}
+
+function fillDefaultsFromLoaded(){
+  var status = document.getElementById("paste-status");
+  var filled = 0;
+  Object.keys(accData).forEach(function(model){
+    if(model === "NWS") return;
+    var a = accData[model] || {};
+    var mae = parseFloat(a.mae);
+    var corr = parseFloat(a.correction);
+    if(isNaN(mae) && isNaN(corr)) return;
+    var maeEl = document.getElementById("def-mae-"+model);
+    var corrEl = document.getElementById("def-corr-"+model);
+    if(maeEl && !isNaN(mae)) maeEl.value = mae;
+    if(corrEl && !isNaN(corr)) corrEl.value = corr;
+    if(maeEl || corrEl) filled++;
+  });
+  status.style.color = filled > 0 ? "var(--green)" : "var(--red)";
+  status.textContent = filled + " models filled from loaded accuracy — hit Save Defaults to commit.";
+}
+
+function parseAndFillDefaults(){
+  var raw = (document.getElementById("paste-defaults-input").value || "").trim();
+  var status = document.getElementById("paste-status");
+  if(!raw){ status.textContent = "Nothing to parse."; return; }
+  var aliases = {
+    "NBS-MOS":"NBS-MOS","NBSMOS":"NBS-MOS",
+    "GFS-MOS":"GFS-MOS","GFSMOS":"GFS-MOS",
+    "LAV-MOS":"LAV-MOS","LAVMOS":"LAV-MOS",
+    "NAM-MOS":"NAM-MOS","NAMMOS":"NAM-MOS",
+    "GEM-GDPS":"GEM-GDPS","GEMGDPS":"GEM-GDPS",
+    "GEM-HRDPS":"GEM-HRDPS","GEMHRDPS":"GEM-HRDPS",
+    "ECMWF-IFS":"ECMWF-IFS","ECMWFIFS":"ECMWF-IFS",
+    "ECMWF-HRES":"ECMWF-HRES","ECMWFHRES":"ECMWF-HRES",
+  };
+  var filled = 0, skipped = 0;
+  raw.split("\n").forEach(function(line){
+    line = line.trim();
+    if(!line || line.toLowerCase().startsWith("model")) return;
+    var cols = line.split(/\t+|\s{2,}/);
+    if(cols.length < 3) return;
+    var rawModel = cols[0].trim().toUpperCase();
+    var model = aliases[rawModel] || rawModel;
+    var mae = parseFloat(cols[1].replace(/[°\s]/g,""));
+    var corr = parseFloat(cols[2].replace(/[°F\s]/g,""));
+    if(isNaN(mae) || isNaN(corr)){ skipped++; return; }
+    var maeEl = document.getElementById("def-mae-"+model);
+    var corrEl = document.getElementById("def-corr-"+model);
+    if(maeEl && corrEl){
+      maeEl.value = mae; corrEl.value = corr; filled++;
+    } else {
+      if(!accData[model]) accData[model] = {runs:{}};
+      if(!accData[model].runs) accData[model].runs = {};
+      accData[model].runs["default"] = {mae:mae, correction:corr};
+      filled++;
+    }
+  });
+  status.style.color = filled > 0 ? "var(--green)" : "var(--red)";
+  status.textContent = filled+" models filled"+(skipped?", "+skipped+" skipped":"")+" — hit Save Defaults to commit.";
 }
 
 function saveDefaults(){
