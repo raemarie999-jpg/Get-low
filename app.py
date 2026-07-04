@@ -195,18 +195,22 @@ def local_now():
     return station_local_now("KPHL")
 
 def get_low_window(station="KPHL"):
-    tz_offset = STATION_TZ_OFFSET.get(station, -5)
-    now_local = station_local_now(station)
-    if now_local.hour > 9 or (now_local.hour == 9 and now_local.minute >= 30):
-        # After 9:30am: target tomorrow night 1AM -> day after 1AM
-        tomorrow_1am = (now_local + timedelta(days=1)).replace(hour=1, minute=0, second=0, microsecond=0)
-        window_start_utc = tomorrow_1am - timedelta(hours=tz_offset)
-        window_end_utc = window_start_utc + timedelta(hours=24)
+    """
+    NWS low temp window is always 1AM EST = 06:00 UTC to 06:00 UTC.
+    Before 14:30 UTC (9:30am EST): show current period (yesterday 06Z -> today 06Z).
+    After 14:30 UTC: show next period (today 06Z -> tomorrow 06Z).
+    This matches the original working logic and keeps everything in UTC.
+    """
+    now_utc = datetime.utcnow()
+    # 14:30 UTC = 9:30am EST
+    cutoff = now_utc.replace(hour=14, minute=30, second=0, microsecond=0)
+    if now_utc >= cutoff:
+        # After 9:30am EST: next period
+        window_start_utc = now_utc.replace(hour=6, minute=0, second=0, microsecond=0) + timedelta(days=1)
     else:
-        # Before 9:30am: target last night 1AM -> tonight 1AM
-        today_1am = now_local.replace(hour=1, minute=0, second=0, microsecond=0)
-        window_start_utc = today_1am - timedelta(hours=tz_offset)
-        window_end_utc = window_start_utc + timedelta(hours=24)
+        # Before 9:30am EST: current period
+        window_start_utc = now_utc.replace(hour=6, minute=0, second=0, microsecond=0)
+    window_end_utc = window_start_utc + timedelta(hours=24)
     return window_start_utc, window_end_utc
 
 def low_window_entries(temps, station="KPHL"):
@@ -597,9 +601,9 @@ def api_state():
                 w = 1/mae; pw_sum += float(pace)*w; pw_total += w
         except: pass
     consensus_pace = round(pw_sum/pw_total, 2) if pw_total > 0 else None
-    _tz = STATION_TZ_OFFSET.get(station, -5)
-    ws_local = window_start + timedelta(hours=_tz)
-    we_local = window_end + timedelta(hours=_tz)
+    # Window label always in EST (UTC-5) to match NWS convention
+    ws_local = window_start + timedelta(hours=-5)
+    we_local = window_end + timedelta(hours=-5)
     window_label = f"{ws_local.strftime('%a %-I%p')} – {we_local.strftime('%a %-I%p')}"
     return jsonify({
         "station": station, "obs": st["obs"], "wethr_low": st["wethr_low"],
