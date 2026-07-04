@@ -156,12 +156,18 @@ def add_log(msg, level="info", station="KPHL"):
 
 def _throttle():
     global _last_request_time
-    with _api_lock:
+    acquired = _api_lock.acquire(timeout=30)
+    if not acquired:
+        print("WARNING: _api_lock timeout — lock was held too long, proceeding anyway", flush=True)
+        return
+    try:
         now = time.monotonic()
         wait = MIN_REQUEST_INTERVAL - (now - _last_request_time)
         if wait > 0:
             time.sleep(wait)
         _last_request_time = time.monotonic()
+    finally:
+        _api_lock.release()
 
 def wethr_get(path):
     _check_and_increment()  # raises DailyCapExceeded before any sleep/request
