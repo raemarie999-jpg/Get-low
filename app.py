@@ -198,16 +198,18 @@ def get_low_window(station="KPHL"):
     tz_offset = STATION_TZ_OFFSET.get(station, -5)
     now_local = station_local_now(station)
     if now_local.hour > 9 or (now_local.hour == 9 and now_local.minute >= 30):
-        tomorrow = now_local.replace(hour=1, minute=0, second=0, microsecond=0) + timedelta(days=1)
-        window_start_utc = tomorrow + timedelta(hours=abs(tz_offset))
+        # After 9:30am: target tomorrow night 1AM -> day after 1AM
+        tomorrow_1am = (now_local + timedelta(days=1)).replace(hour=1, minute=0, second=0, microsecond=0)
+        window_start_utc = tomorrow_1am - timedelta(hours=tz_offset)
         window_end_utc = window_start_utc + timedelta(hours=24)
     else:
+        # Before 9:30am: target last night 1AM -> tonight 1AM
         today_1am = now_local.replace(hour=1, minute=0, second=0, microsecond=0)
-        window_start_utc = today_1am + timedelta(hours=abs(tz_offset))
+        window_start_utc = today_1am - timedelta(hours=tz_offset)
         window_end_utc = window_start_utc + timedelta(hours=24)
     return window_start_utc, window_end_utc
 
-def low_window_entries(temps):
+def low_window_entries(temps, station="KPHL"):
     window_start, window_end = get_low_window(station)
     filtered = [x for x in temps if parse_vt(x) is not None and window_start <= parse_vt(x) < window_end]
     return filtered
