@@ -460,6 +460,62 @@ def build_snapshot_rows(station="KPHL"):
         rows.append({"model": model, "pace": pace})
     return rows
 
+def weighted_consensus(items, decimals=1):
+    """
+    Weighted average of model values using inverse-variance-style weighting:
+        weight = 1 / (MAE * RMSE)
+    instead of plain 1/MAE. This penalizes models that are both biased AND
+    volatile much harder than MAE alone (e.g. a model with a great MAE but
+    a wide RMSE stops dominating consensus).
+
+    Also applies a median/MAD outlier gate: any model whose value sits more
+    than 3x the group's MAD away from the median is dropped from the
+    average entirely (still shown in the UI table, just excluded from the
+    blend). MAD is floored at 1.0F so a tight, well-agreeing pack doesn't
+    trigger false exclusions.
+
+    items: list of {"value": float, "mae": float, "rmse": float|None}
+    Returns rounded float or None if nothing valid.
+    """
+    valid = []
+    for it in items:
+        try:
+            v = float(it.get("value"))
+            mae = float(it.get("mae") or 0)
+            if mae <= 0:
+                continue
+        except (TypeError, ValueError):
+            continue
+        try:
+            rmse = float(it.get("rmse") or 0)
+            if rmse <= 0:
+                rmse = mae  # fall back to MAE-only weighting if RMSE missing
+        except (TypeError, ValueError):
+            rmse = mae
+        valid.append({"value": v, "mae": mae, "rmse": rmse})
+
+    if not valid:
+        return None
+
+    n = len(valid)
+    vals = sorted(x["value"] for x in valid)
+    median = vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2
+    devs = sorted(abs(x["value"] - median) for x in valid)
+    mad = devs[n // 2] if n % 2 else (devs[n // 2 - 1] + devs[n // 2]) / 2
+    mad = max(mad, 1.0)
+
+    filtered = [x for x in valid if abs(x["value"] - median) <= 3 * mad] if n >= 4 else valid
+    if not filtered:
+        filtered = valid  # never fall through to nothing
+
+    w_sum, w_total = 0.0, 0.0
+    for x in filtered:
+        w = 1 / (x["mae"] * x["rmse"])
+        w_sum += x["value"] * w
+        w_total += w
+
+    return round(w_sum / w_total, decimals) if w_total > 0 else None
+
 def save_consensus_snapshot(station="KPHL"):
     st = get_state(station)
     now = local_now(station)
@@ -470,8 +526,8 @@ def save_consensus_snapshot(station="KPHL"):
     acc = st.get("accuracy", {})
     forecasts = st.get("forecasts", {})
     models = [m for m in acc.keys() if m != "NWS"]
-    w_sum, w_total = 0, 0
-    pw_sum, pw_total = 0, 0
+    cons_items = []
+    pace_items = []
     obs_temp = (st.get("obs") or {}).get("temperature_display")
     for model in models:
         a = acc.get(model, {})
@@ -484,27 +540,25 @@ def save_consensus_snapshot(station="KPHL"):
         # Fall back to overall correction if run_data has none
         if corr in (None, ""):
             corr = a.get("correction")
+        mae_val = run_data.get("mae") if run_data else None
+        if not mae_val:
+            mae_val = a.get("mae")
+        rmse_val = run_data.get("rmse") if run_data else None
+        if not rmse_val:
+            rmse_val = a.get("rmse")
         try:
-            mae_val = run_data.get("mae") if run_data else None
-            if not mae_val:
-                mae_val = a.get("mae")
-            mae = float(mae_val or 0)
             adj = round(float(raw) + float(corr), 1) if raw is not None and corr not in (None, "") else None
-            if mae > 0 and adj is not None:
-                w = 1/mae; w_sum += adj*w; w_total += w
+            if adj is not None:
+                cons_items.append({"value": adj, "mae": mae_val, "rmse": rmse_val})
         except: pass
         try:
             current_fcst = fcst.get("current_fcst")
             pace = round(float(obs_temp) - float(current_fcst), 2) if obs_temp and current_fcst else None
-            mae_val = run_data.get("mae") if run_data else None
-            if not mae_val:
-                mae_val = a.get("mae")
-            mae = float(mae_val or 0)
-            if mae > 0 and pace is not None:
-                w = 1/mae; pw_sum += float(pace)*w; pw_total += w
+            if pace is not None:
+                pace_items.append({"value": pace, "mae": mae_val, "rmse": rmse_val})
         except: pass
-    consensus = round(w_sum/w_total, 1) if w_total > 0 else None
-    cons_pace = round(pw_sum/pw_total, 2) if pw_total > 0 else None
+    consensus = weighted_consensus(cons_items)
+    cons_pace = weighted_consensus(pace_items, decimals=2)
     implied = round(consensus + cons_pace, 1) if consensus is not None and cons_pace is not None else None
     if consensus is None:
         return
@@ -615,22 +669,23 @@ def api_state():
             except: pass
         return None
 
-    w_sum, w_total = 0, 0
+    cons_items = []
     for r in rows:
         try:
             mae = get_mae(r); adj = r["adj_low"] if r["adj_low"] is not None else r["raw_low"]
-            if mae and mae > 0 and adj is not None:
-                w = 1/mae; w_sum += adj*w; w_total += w
+            if adj is not None:
+                cons_items.append({"value": float(adj), "mae": mae, "rmse": r.get("rmse")})
         except: pass
-    consensus = round(w_sum/w_total, 1) if w_total > 0 else None
-    pw_sum, pw_total = 0, 0
+    consensus = weighted_consensus(cons_items)
+
+    pace_items = []
     for r in rows:
         try:
             mae = get_mae(r); pace = r["pace"]
-            if mae and mae > 0 and pace is not None:
-                w = 1/mae; pw_sum += float(pace)*w; pw_total += w
+            if pace is not None:
+                pace_items.append({"value": float(pace), "mae": mae, "rmse": r.get("rmse")})
         except: pass
-    consensus_pace = round(pw_sum/pw_total, 2) if pw_total > 0 else None
+    consensus_pace = weighted_consensus(pace_items, decimals=2)
     offset = STATION_TZ_OFFSET.get(station, -5)
     ws_local = window_start + timedelta(hours=offset)
     we_local = window_end + timedelta(hours=offset)
