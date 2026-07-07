@@ -32,14 +32,14 @@ def save_json_file(path, data):
         add_log(f"Save error {path}: {e}", "err")
         return False
 
-STATIONS = ["KPHL","KATL","KOKC","KDCA","KBOS","KDEN","KHOU","KLAS","KMDW","KMSP"]
+STATIONS = ["KPHL","KATL","KOKC","KDCA","KBOS","KSAT","KHOU","KLAS","KMDW","KMSP"]
 STATION_NAMES = {
     "KPHL": "Philadelphia International Airport",
     "KATL": "Atlanta Hartsfield-Jackson Airport",
     "KOKC": "Oklahoma City Will Rogers World Airport",
     "KDCA": "Washington Reagan National Airport",
     "KBOS": "Boston Logan International Airport",
-    "KDEN": "Denver International Airport",
+    "KSAT": "San Antonio International Airport",
     "KHOU": "Houston William P. Hobby Airport",
     "KLAS": "Las Vegas Harry Reid International Airport",
     "KMDW": "Chicago Midway International Airport",
@@ -47,12 +47,12 @@ STATION_NAMES = {
 }
 STATION_TZ_OFFSET = {
     "KPHL": -5, "KATL": -5, "KOKC": -6, "KDCA": -5, "KBOS": -5,
-    "KDEN": -7, "KHOU": -6, "KLAS": -8, "KMDW": -6, "KMSP": -6,
+    "KSAT": -6, "KHOU": -6, "KLAS": -8, "KMDW": -6, "KMSP": -6,
 }
 BACKGROUND_STATIONS = ["KPHL", "KATL", "KOKC"]
 STATION_LON = {
     "KPHL": -75.2408, "KATL": -84.4277, "KOKC": -97.6007,
-    "KDCA": -77.0377, "KBOS": -71.0052, "KDEN": -104.6737,
+    "KDCA": -77.0377, "KBOS": -71.0052, "KSAT": -98.4798,
     "KHOU": -95.2789, "KLAS": -115.1523, "KMDW": -87.7524, "KMSP": -93.2218,
 }
 _SKY_COVER_MAP = {"CLR": 0, "SKC": 0, "FEW": 1, "SCT": 3, "BKN": 5, "OVC": 7, "OVX": 8}
@@ -1169,14 +1169,14 @@ th.default-col{color:var(--orange) !important}
 </main>
 
 <script>
-var STATION_LIST = ["KPHL","KATL","KOKC","KDCA","KBOS","KDEN","KHOU","KLAS","KMDW","KMSP"];
+var STATION_LIST = ["KPHL","KATL","KOKC","KDCA","KBOS","KSAT","KHOU","KLAS","KMDW","KMSP"];
 var STATION_NAMES_JS = {
   "KPHL":"Philadelphia International Airport",
   "KATL":"Atlanta Hartsfield-Jackson Airport",
   "KOKC":"Oklahoma City Will Rogers World Airport",
   "KDCA":"Washington Reagan National Airport",
   "KBOS":"Boston Logan International Airport",
-  "KDEN":"Denver International Airport",
+  "KSAT":"San Antonio International Airport",
   "KHOU":"Houston William P. Hobby Airport",
   "KLAS":"Las Vegas Harry Reid International Airport",
   "KMDW":"Chicago Midway International Airport",
