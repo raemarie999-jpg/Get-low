@@ -460,21 +460,65 @@ def build_snapshot_rows(station="KPHL"):
         rows.append({"model": model, "pace": pace})
     return rows
 
+RUN_AGE_HALF_LIFE_HOURS = 12.0  # freshness weight halves every 12 hours
+RUN_AGE_MIN_DECAY = 0.15        # even a maximally stale run keeps at least 15% of its age credit
+RMSE_TOLERANCE = 1.25           # a model's RMSE up to 25% above the group median gets no penalty at all
+RMSE_FLOOR = 0.5                # even a wildly volatile model never loses more than 50% weight from RMSE alone
+
+def run_age_hours(run_label, now_utc=None):
+    """
+    Estimates hours since a model run's nominal cycle time (e.g. "12Z" -> 12:00 UTC
+    today, or yesterday if that hour hasn't happened yet today). Does NOT account
+    for per-model publish latency (e.g. GFS's 12Z run isn't actually available
+    until ~17-18Z) -- treats every model's age relative to its own nominal cycle
+    label uniformly, which is a simplification worth knowing about.
+    Returns None if the run label can't be parsed (age is then treated as neutral).
+    """
+    if not run_label:
+        return None
+    try:
+        run_hour = int(str(run_label).upper().replace("Z", "").strip())
+    except (TypeError, ValueError):
+        return None
+    now_utc = now_utc or datetime.utcnow()
+    run_dt = now_utc.replace(hour=run_hour % 24, minute=0, second=0, microsecond=0)
+    if run_dt > now_utc:
+        run_dt -= timedelta(days=1)
+    return (now_utc - run_dt).total_seconds() / 3600.0
+
+def run_age_decay(run_label, now_utc=None):
+    """
+    Multiplicative freshness factor in (RUN_AGE_MIN_DECAY, 1.0]. A brand new run
+    scores ~1.0; age erodes it on a half-life curve, floored so an old run is
+    down-weighted, never excluded outright. Unknown/unparseable run labels get
+    a neutral 1.0 (don't penalize what we can't measure).
+    """
+    age = run_age_hours(run_label, now_utc)
+    if age is None:
+        return 1.0
+    decay = 0.5 ** (age / RUN_AGE_HALF_LIFE_HOURS)
+    return max(RUN_AGE_MIN_DECAY, decay)
+
 def weighted_consensus(items, decimals=1):
     """
-    Weighted average of model values using inverse-variance-style weighting:
-        weight = 1 / (MAE * RMSE)
-    instead of plain 1/MAE. This penalizes models that are both biased AND
-    volatile much harder than MAE alone (e.g. a model with a great MAE but
-    a wide RMSE stops dominating consensus).
+    Weighted average of model values using:
+        weight = (1/MAE) * run_age_decay * rmse_leveler
+    Priority order (as designed): MAE leads at full linear strength, run
+    freshness is a real secondary factor (half-life decay curve), and RMSE acts
+    as a LEVELER rather than a continuous multiplier: a model's RMSE within
+    RMSE_TOLERANCE (25%) of that day's group median gets zero penalty -- normal
+    variation is ignored entirely. Only once a model's RMSE meaningfully exceeds
+    its peers does a penalty kick in, and it's capped at RMSE_FLOOR (50%) so a
+    single bad-RMSE model can never dominate or crater the blend. This means
+    RMSE mostly stays out of the way; it only intervenes on real outliers.
 
-    Also applies a median/MAD outlier gate: any model whose value sits more
-    than 3x the group's MAD away from the median is dropped from the
-    average entirely (still shown in the UI table, just excluded from the
-    blend). MAD is floored at 1.0F so a tight, well-agreeing pack doesn't
-    trigger false exclusions.
+    Also applies a median/MAD outlier gate on the VALUES themselves: any model
+    whose forecast sits more than 3x the group's MAD away from the median is
+    dropped from the average entirely (still shown in the UI table, just
+    excluded from the blend). MAD is floored at 1.0F so a tight, well-agreeing
+    pack doesn't trigger false exclusions.
 
-    items: list of {"value": float, "mae": float, "rmse": float|None}
+    items: list of {"value": float, "mae": float, "rmse": float|None, "run": str|None}
     Returns rounded float or None if nothing valid.
     """
     valid = []
@@ -492,7 +536,8 @@ def weighted_consensus(items, decimals=1):
                 rmse = mae  # fall back to MAE-only weighting if RMSE missing
         except (TypeError, ValueError):
             rmse = mae
-        valid.append({"value": v, "mae": mae, "rmse": rmse})
+        age_decay = run_age_decay(it.get("run"))
+        valid.append({"value": v, "mae": mae, "rmse": rmse, "age_decay": age_decay})
 
     if not valid:
         return None
@@ -508,9 +553,21 @@ def weighted_consensus(items, decimals=1):
     if not filtered:
         filtered = valid  # never fall through to nothing
 
+    # RMSE leveler: compare each model's RMSE to the group's median RMSE.
+    # No penalty within tolerance; capped penalty beyond it.
+    rmse_vals = sorted(x["rmse"] for x in filtered)
+    m = len(rmse_vals)
+    median_rmse = rmse_vals[m // 2] if m % 2 else (rmse_vals[m // 2 - 1] + rmse_vals[m // 2]) / 2
+    median_rmse = max(median_rmse, 0.1)  # guard against a degenerate all-zero group
+
     w_sum, w_total = 0.0, 0.0
     for x in filtered:
-        w = 1 / (x["mae"] * x["rmse"])
+        rmse_ratio = x["rmse"] / median_rmse
+        if rmse_ratio <= RMSE_TOLERANCE:
+            rmse_factor = 1.0
+        else:
+            rmse_factor = max(RMSE_FLOOR, RMSE_TOLERANCE / rmse_ratio)
+        w = (1 / x["mae"]) * x["age_decay"] * rmse_factor
         w_sum += x["value"] * w
         w_total += w
 
@@ -549,13 +606,13 @@ def save_consensus_snapshot(station="KPHL"):
         try:
             adj = round(float(raw) + float(corr), 1) if raw is not None and corr not in (None, "") else None
             if adj is not None:
-                cons_items.append({"value": adj, "mae": mae_val, "rmse": rmse_val})
+                cons_items.append({"value": adj, "mae": mae_val, "rmse": rmse_val, "run": current_run})
         except: pass
         try:
             current_fcst = fcst.get("current_fcst")
             pace = round(float(obs_temp) - float(current_fcst), 2) if obs_temp and current_fcst else None
             if pace is not None:
-                pace_items.append({"value": pace, "mae": mae_val, "rmse": rmse_val})
+                pace_items.append({"value": pace, "mae": mae_val, "rmse": rmse_val, "run": current_run})
         except: pass
     consensus = weighted_consensus(cons_items)
     cons_pace = weighted_consensus(pace_items, decimals=2)
@@ -674,7 +731,7 @@ def api_state():
         try:
             mae = get_mae(r); adj = r["adj_low"] if r["adj_low"] is not None else r["raw_low"]
             if adj is not None:
-                cons_items.append({"value": float(adj), "mae": mae, "rmse": r.get("rmse")})
+                cons_items.append({"value": float(adj), "mae": mae, "rmse": r.get("rmse"), "run": r.get("run")})
         except: pass
     consensus = weighted_consensus(cons_items)
 
@@ -683,7 +740,7 @@ def api_state():
         try:
             mae = get_mae(r); pace = r["pace"]
             if pace is not None:
-                pace_items.append({"value": float(pace), "mae": mae, "rmse": r.get("rmse")})
+                pace_items.append({"value": float(pace), "mae": mae, "rmse": r.get("rmse"), "run": r.get("run")})
         except: pass
     consensus_pace = weighted_consensus(pace_items, decimals=2)
     offset = STATION_TZ_OFFSET.get(station, -5)
