@@ -55,6 +55,14 @@ STATION_LON = {
     "KDCA": -77.0377, "KBOS": -71.0052, "KSAT": -98.4798,
     "KHOU": -95.2789, "KLAS": -115.1523, "KMDW": -87.7524, "KMSP": -93.2218,
 }
+STATION_LAT = {
+    "KPHL": 39.8721, "KATL": 33.6407, "KOKC": 35.3931,
+    "KDCA": 38.8512, "KBOS": 42.3656, "KSAT": 29.5312,
+    "KHOU": 29.6454, "KLAS": 36.0840, "KMDW": 41.7868, "KMSP": 44.8848,
+}
+NWS_USER_AGENT = "KalshiWeatherTracker/1.0 (personal use, not for redistribution)"
+# ^ NWS API requires a descriptive User-Agent identifying the app; no API key needed.
+# Replace with a contact email if you want to be fully compliant with their request.
 _SKY_COVER_MAP = {"CLR": 0, "SKC": 0, "FEW": 1, "SCT": 3, "BKN": 5, "OVC": 7, "OVX": 8}
 
 ALL_KNOWN_MODELS = [
@@ -129,6 +137,7 @@ def make_state():
     return {
         "obs": None,
         "wethr_low": None,
+        "nws_forecast": None,
         "forecasts": {},
         "accuracy": {},
         "last_updated": None,
@@ -272,6 +281,66 @@ def get_run_data(acc_model, run_key):
     # 3. Nothing run-specific found
     return {}, "overall"
 
+def get_nws_gridpoint(station):
+    """
+    Resolves and caches (station -> gridId/gridX/gridY/forecast_url) via the NWS
+    /points endpoint. This mapping is static per lat/lon, so it's cached to disk
+    instead of re-resolved every fetch -- NWS's API docs explicitly ask consumers
+    to cache this rather than hit /points repeatedly.
+    """
+    cache = load_json_file(f"{DATA_DIR}/nws_gridpoints.json", {})
+    if station in cache and cache[station].get("forecast_url"):
+        return cache[station]
+    lat = STATION_LAT.get(station)
+    lon = STATION_LON.get(station)
+    if lat is None or lon is None:
+        return None
+    headers = {"User-Agent": NWS_USER_AGENT, "Accept": "application/geo+json"}
+    r = requests.get(f"https://api.weather.gov/points/{lat},{lon}", headers=headers, timeout=10)
+    r.raise_for_status()
+    props = r.json().get("properties", {})
+    entry = {
+        "gridId": props.get("gridId"),
+        "gridX": props.get("gridX"),
+        "gridY": props.get("gridY"),
+        "forecast_url": props.get("forecast"),
+    }
+    cache[station] = entry
+    save_json_file(f"{DATA_DIR}/nws_gridpoints.json", cache)
+    return entry
+
+def fetch_nws_forecast(station="KPHL"):
+    """
+    Pulls the actual official NWS forecast LOW (the real forecaster-issued
+    overnight low) via api.weather.gov -- not a model, not wethr.net's own
+    approximation of NWS methodology. This is what Kalshi settles its weather
+    markets against, so it's the single most directly relevant reference point
+    on the dashboard. Free, no API key, no daily cap. Returns a dict or None.
+    """
+    try:
+        gp = get_nws_gridpoint(station)
+        if not gp or not gp.get("forecast_url"):
+            return None
+        headers = {"User-Agent": NWS_USER_AGENT, "Accept": "application/geo+json"}
+        r = requests.get(gp["forecast_url"], headers=headers, timeout=10)
+        r.raise_for_status()
+        periods = r.json().get("properties", {}).get("periods", [])
+        if not periods:
+            return None
+        # The first NIGHTTIME period is "tonight's low" in the NWS forecast
+        # product (periods alternate Day/Night: "Today"/"Tonight"/"Tomorrow"/etc.)
+        tonight_period = next((p for p in periods if not p.get("isDaytime")), None)
+        if not tonight_period:
+            return None
+        return {
+            "low": tonight_period.get("temperature"),
+            "period_name": tonight_period.get("name"),
+            "short_forecast": tonight_period.get("shortForecast"),
+            "updated": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+    except Exception:
+        return None
+
 def fetch_all(station="KPHL"):
     st = get_state(station)
     if not API_KEY:
@@ -313,6 +382,17 @@ def fetch_all(station="KPHL"):
     except Exception as e:
         errors.append(f"WethrLow: {e}")
         add_log(f"Wethr Low error: {e}", "err", station)
+
+    # Official NWS forecast low (what Kalshi settles against) -- free API, no cap
+    try:
+        nws = fetch_nws_forecast(station)
+        st["nws_forecast"] = nws
+        if nws and nws.get("low") is not None:
+            add_log(f"NWS Forecast: {nws['low']}F ({nws.get('period_name')})", "ok", station)
+        else:
+            add_log("NWS Forecast: no data returned", "warn", station)
+    except Exception as e:
+        add_log(f"NWS Forecast error: {e}", "warn", station)
 
     fetch_targets = active_models(station)
     if not fetch_targets:
@@ -749,6 +829,7 @@ def api_state():
     window_label = f"{ws_local.strftime('%a %-I%p')} – {we_local.strftime('%a %-I%p')}"
     return jsonify({
         "station": station, "obs": st["obs"], "wethr_low": st["wethr_low"],
+        "nws_forecast": st.get("nws_forecast"),
         "rows": rows, "consensus": consensus,
         "last_updated": st["last_updated"], "errors": st["errors"],
         "log": st["log"][:30], "models": active_models(station),
@@ -958,6 +1039,12 @@ th.default-col{color:var(--orange) !important}
       <div class="sub2">NWS logic</div>
     </div>
     <div class="sp"></div>
+    <div class="stat-pill" id="h-nws-pill" style="display:none">
+      <div class="lbl">NWS Forecast</div>
+      <div class="val" id="h-nws" style="color:#38bdf8">--</div>
+      <div class="sub2" id="h-nws-sub">official</div>
+    </div>
+    <div class="sp"></div>
     <div class="stat-pill">
       <div class="lbl">Consensus</div>
       <div class="val" id="h-con" style="color:var(--blue)">--</div>
@@ -998,6 +1085,7 @@ th.default-col{color:var(--orange) !important}
   <div class="srow">
     <div class="sc"><div class="lbl">Current Temp</div><div class="v" id="s-obs" style="color:var(--yellow)">--</div><div class="s" id="s-obs-t">awaiting</div></div>
     <div class="sc"><div class="lbl">Wethr Low</div><div class="v" id="s-wl" style="color:var(--ice)">--</div><div class="s">NWS logic</div></div>
+    <div class="sc" id="s-nws-sc" style="display:none"><div class="lbl">NWS Forecast Low</div><div class="v" id="s-nws" style="color:#38bdf8">--</div><div class="s" id="s-nws-sub">official, settles Kalshi</div></div>
     <div class="sc"><div class="lbl">Consensus Low</div><div class="v" id="s-con" style="color:var(--blue)">--</div><div class="s">MAE-weighted adj</div></div>
     <div class="sc"><div class="lbl">Models Live</div><div class="v" id="s-mods" style="color:var(--purple)">--</div><div class="s">forecast runs</div></div>
     <div class="sc"><div class="lbl">Target Window</div><div style="font-size:12px;font-weight:600;color:var(--ice);margin-top:6px" id="s-window">--</div></div>
@@ -1269,7 +1357,7 @@ function updateStationButtons(){
 }
 
 function clearDisplay(){
-  ["h-obs","h-wl","h-con","s-obs","s-wl","s-con"].forEach(function(id){
+  ["h-obs","h-wl","h-con","s-obs","s-wl","s-con","h-nws","s-nws"].forEach(function(id){
     var el = document.getElementById(id); if(el) el.textContent="--";
   });
   ["h-obs-t","s-obs-t"].forEach(function(id){
@@ -1582,6 +1670,24 @@ function render(data){
     document.getElementById("h-wl").textContent = wl.wethr_low+"F";
     document.getElementById("s-wl").textContent = wl.wethr_low+"F";
   }
+  try {
+    var nwsF = data.nws_forecast;
+    var nwsPill = document.getElementById("h-nws-pill");
+    var nwsSc = document.getElementById("s-nws-sc");
+    if(nwsF && nwsF.low != null){
+      var nwsVal = nwsF.low + "F";
+      var nwsSub = nwsF.period_name || "official";
+      document.getElementById("h-nws").textContent = nwsVal;
+      document.getElementById("h-nws-sub").textContent = nwsSub;
+      document.getElementById("s-nws").textContent = nwsVal;
+      document.getElementById("s-nws-sub").textContent = nwsSub + " · settles Kalshi";
+      if(nwsPill) nwsPill.style.display = "block";
+      if(nwsSc) nwsSc.style.display = "block";
+    } else {
+      if(nwsPill) nwsPill.style.display = "none";
+      if(nwsSc) nwsSc.style.display = "none";
+    }
+  } catch(e){ console.error("NWS forecast render error", e); }
   if(con){
     document.getElementById("h-con").textContent = con+"F";
     document.getElementById("s-con").textContent = con+"F";
